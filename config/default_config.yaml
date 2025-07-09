@@ -1,0 +1,3 @@
+uri: mongodb://localhost:27017
+db_name: contextchain_db
+ccshare_path: null

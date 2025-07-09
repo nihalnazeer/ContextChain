@@ -1,0 +1,41 @@
+{
+  "pipeline_id": "your_pipeline_id",
+  "schema_version": "v1.0.0",
+  "description": "Description of the pipeline",
+  "created_by": "your_username",
+  "created_at": "2025-07-10T01:30:00Z",
+  "tasks": [
+    {
+      "task_id": 1,
+      "description": "Description of the task",
+      "task_type": "GET",
+      "endpoint": "http://example.com/your_endpoint",
+      "inputs": [],
+      "input_source": "http://example.com/your_source",
+      "output_collection": "task_results",
+      "wait_for_input": false
+    },
+    {
+      "task_id": 2,
+      "description": "Description of the next task",
+      "task_type": "LOCAL",
+      "endpoint": "path.to.your_function",
+      "inputs": [1],
+      "output_collection": "task_results",
+      "wait_for_input": false
+    }
+  ],
+  "global_config": {
+    "default_output_db": "test_db",
+    "logging_level": "INFO",
+    "retry_on_failure": true,
+    "max_retries": 2,
+    "allowed_task_types": ["GET", "LOCAL", "LLM"],
+    "allowed_domains": ["example.com"]
+  },
+  "metadata": {
+    "tags": ["tag1", "tag2"],
+    "pipeline_type": "fullstack-ai",
+    "linked_pipelines": []
+  }
+}
