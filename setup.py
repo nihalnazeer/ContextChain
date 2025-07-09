@@ -2,10 +2,10 @@ from setuptools import setup, find_packages
 
 setup(
     name='contextchain',
-    version='1.0.0',
+    version='1.0.0 BETA',
     description='Pipeline-based execution framework for contextual task chains',
     author='Nihal Nazeer',
-    author_email='youremail@example.com',
+    author_email='Nhaal160@gmail.com',
     packages=find_packages(exclude=['tests']),
     install_requires=[
         'requests',

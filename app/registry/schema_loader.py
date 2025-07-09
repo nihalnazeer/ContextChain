@@ -5,7 +5,7 @@ from typing import Dict, Any
 import logging
 from app.engine.validator import validate_schema
 from app.engine.registry import registry
-from version_manager import VersionManager
+from .version_manager import VersionManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +48,23 @@ class SchemaLoader:
                 if self.load_from_file(filename):
                     loaded_count += 1
         return loaded_count
+
+def load_schema(client, db_name: str, pipeline_id: str, version: str = None) -> Dict[str, Any]:
+    """Load a schema from MongoDB based on pipeline ID and optional version."""
+    vm = VersionManager()
+    vm.client = client
+    vm.db = client[db_name]
+    versions = vm.list_versions(pipeline_id)
+    if not versions:
+        logger.error(f"No versions found for pipeline {pipeline_id}")
+        return None
+    if version:
+        target_version = next((v for v in versions if v["version"] == version), None)
+        if not target_version:
+            logger.error(f"Version {version} not found for pipeline {pipeline_id}")
+            return None
+        return target_version["schema"]
+    return versions[0]["schema"]  # Return latest version by default
 
 # Example usage
 if __name__ == "__main__":
