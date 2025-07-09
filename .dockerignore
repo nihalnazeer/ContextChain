@@ -9,3 +9,8 @@ cvenv/
 *.sqlite3
 *.log
 .git
+.gitignore
+.env  # Add if you use environment files
+tests/  # Exclude tests if not needed in production image
+Dockerfile
+README.md  # Exclude if not needed
