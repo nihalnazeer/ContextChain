@@ -1,0 +1,5 @@
+pymongo>=4.13.2
+requests>=2.32.4
+pydantic>=2.11.7
+urllib3<2
+python-dotenv>=1.0.0

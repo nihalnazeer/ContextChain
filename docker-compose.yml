@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    image: contextchain:latest
+    container_name: contextchain_app
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+    depends_on:
+      - mongo
+    networks:
+      - contextchain_network
+
+  mongo:
+    image: mongo:latest
+    container_name: contextchain_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - contextchain_network
+
+networks:
+  contextchain_network:
+    driver: bridge
+
+volumes:
+  mongo_data:

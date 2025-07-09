@@ -1,26 +1,33 @@
-# tests/test_executor.py
 import unittest
 from unittest.mock import patch, MagicMock
 import requests
 from app.engine.executor import execute_pipeline, execute_single_task
-from app.db.mongo_client import get_mongo_client
+from app.registry.version_manager import VersionManager
 import copy
 
 class TestExecutor(unittest.TestCase):
     def setUp(self):
-        self.client = get_mongo_client("mongodb://localhost:27017")
+        self.vm = VersionManager()
+        try:
+            self.client = self.vm.get_client()  # Get client with error handling
+        except RuntimeError as e:
+            self.client = None  # Fallback for testing if connection fails
+            self.skipTest(str(e))
         self.db_name = "test_db"
         self.schema = copy.deepcopy(DEMO_SCHEMA)
 
     def tearDown(self):
-        self.client[self.db_name]["task_results"].delete_many({})
-        self.client[self.db_name]["trigger_logs"].delete_many({})
-        self.client.close()  # Ensure MongoClient is closed to avoid ResourceWarning
+        if self.client is not None:
+            self.client[self.db_name]["task_results"].delete_many({})
+            self.client[self.db_name]["trigger_logs"].delete_many({})
+        self.vm.close()  # Close the managed MongoClient
 
     @patch("app.engine.executor.execute_local")
     @patch("app.engine.executor.execute_http")
     @patch("app.engine.executor.execute_llm")
     def test_execute_pipeline(self, mock_llm, mock_http, mock_local):
+        if self.client is None:
+            self.skipTest("MongoClient not available")
         # Mock task executions
         mock_http.return_value = {"status": "success", "output": {"data": "test"}, "task_id": 1}
         mock_local.return_value = {"status": "success", "output": "processed", "task_id": 2}
@@ -36,6 +43,8 @@ class TestExecutor(unittest.TestCase):
 
     @patch("app.engine.executor.execute_local")
     def test_execute_single_task(self, mock_local):
+        if self.client is None:
+            self.skipTest("MongoClient not available")
         mock_local.return_value = {"status": "success", "output": "processed", "task_id": 2}
 
         task = self.schema["tasks"][1]  # Task 2 (LOCAL)
@@ -51,7 +60,10 @@ class TestExecutor(unittest.TestCase):
 
     @patch("app.engine.executor.execute_http")
     def test_execute_single_task_with_retry(self, mock_http):
-        mock_http.side_effect = [Exception("Failed"), {"status": "success", "output": "data", "task_id": 1}]
+        if self.client is None:
+            self.skipTest("MongoClient not available")
+        # Ensure side_effect matches expected retries (e.g., 2 failures + 1 success)
+        mock_http.side_effect = [Exception("Failed")] * 2 + [{"status": "success", "output": "data", "task_id": 1}]
 
         task = self.schema["tasks"][0]  # Task 1 (GET)
         result = execute_single_task(self.client, self.db_name, self.schema, task)
@@ -61,13 +73,15 @@ class TestExecutor(unittest.TestCase):
 
     @patch("app.engine.executor.execute_http")
     def test_execute_api_task(self, mock_http):
+        if self.client is None:
+            self.skipTest("MongoClient not available")
         # Define a schema with an API task and a dependent task
         api_schema = {
             "pipeline_id": "api_test_pipeline",
             "schema_version": "v1.0.0",
             "description": "Test pipeline for API task",
             "created_by": "test_user",
-            "created_at": "2025-07-10T01:30:00Z",  # Updated to current time
+            "created_at": "2025-07-10T03:38:00Z",  # Updated to current time
             "tasks": [
                 {
                     "task_id": 1,
@@ -128,13 +142,15 @@ class TestExecutor(unittest.TestCase):
         self.assertEqual(task1_doc["output"]["api_data"], "sample_data")
 
     def test_execute_real_api_call(self):
+        if self.client is None:
+            self.skipTest("MongoClient not available")
         # Define a schema for a real API call (using a public test API)
         real_api_schema = {
             "pipeline_id": "real_api_test_pipeline",
             "schema_version": "v1.0.0",
             "description": "Test pipeline for real API call",
             "created_by": "test_user",
-            "created_at": "2025-07-10T01:30:00Z",  # Current time
+            "created_at": "2025-07-10T03:38:00Z",  # Current time
             "tasks": [
                 {
                     "task_id": 1,
@@ -198,7 +214,7 @@ DEMO_SCHEMA = {
     "schema_version": "v1.0.0",
     "description": "Demo pipeline for testing executor and validator",
     "created_by": "test_user",
-    "created_at": "2025-07-10T01:30:00Z",  # Updated to current time
+    "created_at": "2025-07-10T03:38:00Z",  # Updated to current time
     "tasks": [
         {
             "task_id": 1,

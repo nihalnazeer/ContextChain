@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 import logging
 from app.db.mongo_client import get_mongo_client
 import datetime
+import os
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -10,15 +11,25 @@ logger = logging.getLogger(__name__)
 
 class VersionManager:
     _instance = None
+    supported_versions = {"v1.0.0"}  # Define as class variable
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(VersionManager, cls).__new__(cls)
-            cls._instance.client = get_mongo_client("mongodb://localhost:27017")
-            cls._instance.db = cls._instance.client["pipeline_db"]
-            cls._instance.version_collection = cls._instance.db["versions"]
-            cls._instance.supported_versions = {"v1.0.0"}  # Add more versions as needed
+            try:
+                cls._instance.client = get_mongo_client()  # Initialize client
+                cls._instance.db = cls._instance.client["pipeline_db"]
+                cls._instance.version_collection = cls._instance.db["versions"]
+            except Exception as e:
+                logger.error(f"Failed to initialize MongoClient: {str(e)}")
+                cls._instance.client = None  # Fallback to None if connection fails
         return cls._instance
+
+    def get_client(self):
+        """Return the MongoClient instance, or raise an error if not initialized."""
+        if self._instance.client is None:
+            raise RuntimeError("MongoClient not initialized. Check connection settings.")
+        return self._instance.client
 
     def get_version(self, schema: Dict[str, Any]) -> str:
         """Extract the version from the schema with fallback to supported version."""
@@ -78,10 +89,10 @@ class VersionManager:
 
     def close(self):
         """Explicitly close the MongoDB client."""
-        if hasattr(self, 'client') and self.client:
-            self.client.close()
+        if hasattr(self._instance, 'client') and self._instance.client:
+            self._instance.client.close()
             logger.info("MongoDB client closed")
-            self.client = None
+            self._instance.client = None
 
 # Module-level functions for CLI compatibility
 def push_schema(client, db_name: str, schema: Dict[str, Any]) -> str:
@@ -112,7 +123,7 @@ if __name__ == "__main__":
         "schema_version": "v1.0.0",
         "description": "Test schema",
         "created_by": "mohammednihal",
-        "created_at": "2025-07-10T03:01:00Z",
+        "created_at": "2025-07-10T03:38:00Z",  # Updated to current time
         "tasks": [],
         "global_config": {},
         "metadata": {}
