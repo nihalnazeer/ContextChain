@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextchain"
-version = "0.1.6"
+version = "0.1.5"
 authors = [
     { name = "Nihal Nazeer", email = "Nhaal160@gmail.com" }
 ]
 description = "A pipeline execution framework with MongoDB integration"
-readme = "Readme.md"
+readme = "README.md"
 requires-python = ">=3.8"
-license = "MIT"
+license = { text = "MIT" }
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -35,8 +35,4 @@ dependencies = [
 "Bug Tracker" = "https://github.com/nihalnazeer/contextchain/issues"
 
 [project.scripts]
-contextchain = "app.cli.main:cli"
-
-[tool.setuptools.packages.find]
-include = ["app*"]
-exclude = ["tests*", "config*"]
+contextchain = "app.cli:main"

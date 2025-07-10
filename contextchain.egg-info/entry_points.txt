@@ -1,2 +1,2 @@
 [console_scripts]
-contextchain = app.cli:main
+contextchain = app.cli.main:cli
