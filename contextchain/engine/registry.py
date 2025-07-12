@@ -1,7 +1,7 @@
 # app/engine/registry.py
 from typing import Dict, Any, List
 import logging
-from app.registry.version_manager import VersionManager
+from contextchain.registry.version_manager import VersionManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

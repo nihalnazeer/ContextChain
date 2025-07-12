@@ -1,8 +1,8 @@
 import logging
 from typing import Dict, List, Any
 import requests
-from app.db.mongo_client import get_mongo_client
-from app.engine.validator import validate_schema
+from contextchain.db.mongo_client import get_mongo_client
+from contextchain.engine.validator import validate_schema
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

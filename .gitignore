@@ -1,1 +1,13 @@
+# Python virtual environment
 cvenv/
+
+# PyPI build artifacts
+dist/
+contextchain.egg-info/
+temp_unpacked_wheel/
+
+# macOS metadata
+.DS_Store
+
+# Backups or temp files
+pyproject.toml.backup

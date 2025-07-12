@@ -1,9 +1,9 @@
 Metadata-Version: 2.4
 Name: contextchain
-Version: 0.1.6
+Version: 0.2.2
 Summary: A pipeline execution framework with MongoDB integration
 Author-email: Nihal Nazeer <Nhaal160@gmail.com>
-License-Expression: MIT
+License: MIT
 Project-URL: Homepage, https://github.com/nihalnazeer/contextchain
 Project-URL: Bug Tracker, https://github.com/nihalnazeer/contextchain/issues
 Classifier: Development Status :: 4 - Beta
@@ -22,6 +22,8 @@ Requires-Dist: requests>=2.32.4
 Requires-Dist: pydantic>=2.11.7
 Requires-Dist: urllib3<2
 Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: click
+Requires-Dist: pyyaml
 Dynamic: license-file
 
 # ContextChain

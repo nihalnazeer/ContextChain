@@ -3,8 +3,8 @@ import json
 import os
 from typing import Dict, Any
 import logging
-from app.engine.validator import validate_schema
-from app.engine.registry import registry
+from contextchain.engine.validator import validate_schema
+from contextchain.engine.registry import registry
 from .version_manager import VersionManager
 
 # Set up logging

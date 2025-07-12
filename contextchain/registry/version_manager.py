@@ -1,7 +1,7 @@
 # app/registry/version_manager.py
 from typing import Dict, Any, List
 import logging
-from app.db.mongo_client import get_mongo_client
+from contextchain.db.mongo_client import get_mongo_client
 import datetime
 import os
 

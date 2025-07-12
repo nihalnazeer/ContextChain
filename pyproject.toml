@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextchain"
-version = "0.1.6"
+version = "0.2.2"  # Increment to a new version
 authors = [
     { name = "Nihal Nazeer", email = "Nhaal160@gmail.com" }
 ]
 description = "A pipeline execution framework with MongoDB integration"
 readme = "Readme.md"
 requires-python = ">=3.8"
-license = "MIT"
+license = {text = "MIT"}
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -27,7 +27,9 @@ dependencies = [
     "requests>=2.32.4",
     "pydantic>=2.11.7",
     "urllib3<2",
-    "python-dotenv>=1.0.0"
+    "python-dotenv>=1.0.0",
+    "click",
+    "pyyaml"  # Added for yaml dependency
 ]
 
 [project.urls]
@@ -35,8 +37,8 @@ dependencies = [
 "Bug Tracker" = "https://github.com/nihalnazeer/contextchain/issues"
 
 [project.scripts]
-contextchain = "app.cli.main:cli"
+contextchain = "contextchain.cli.main:cli"  # Updated from app.cli.main
 
-[tool.setuptools.packages.find]
-include = ["app*"]
-exclude = ["tests*", "config*"]
+[tool.setuptools]
+packages = {find = {}}  # Automatically discover contextchain package
+include-package-data = true

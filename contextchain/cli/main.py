@@ -5,12 +5,18 @@ import json
 import yaml
 from datetime import datetime
 from pathlib import Path
-from app.engine.validator import validate_schema
-from app.engine.executor import execute_pipeline, execute_single_task
-from app.registry.version_manager import push_schema, list_versions, rollback_version
-from app.registry.schema_loader import load_schema
-from app.db.mongo_client import get_mongo_client
-from app.db.collections import setup_collections
+from contextchain.engine.validator import validate_schema
+from contextchain.engine.executor import execute_pipeline, execute_single_task
+from contextchain.registry.version_manager import push_schema, list_versions, rollback_version
+from contextchain.registry.schema_loader import load_schema
+from contextchain.db.mongo_client import get_mongo_client
+from contextchain.db.collections import setup_collections
+import subprocess
+import os
+import time
+
+# Global variable to track the mongod process
+mongod_process = None
 
 # Force colorama initialization for better color support
 try:
@@ -21,8 +27,6 @@ except ImportError:
 
 def show_banner():
     """Display the CLI banner with ASCII art and colors."""
-    
-    # ASCII art for ContextChain
     ascii_art = r"""
  ██████╗ ██████╗ ███╗   ██╗████████╗███████╗██╗  ██╗████████╗
 ██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██╔════╝╚██╗██╔╝╚══██╔══╝
@@ -38,18 +42,14 @@ def show_banner():
 ╚██████╗██║  ██║██║  ██║██║██║ ╚████║
  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝
     """
-    
-    # Display the banner
     click.secho("=" * 60, fg="bright_blue", bold=True)
     click.secho(ascii_art, fg="bright_blue", bold=True)
     click.secho("         Orchestrating AI & Full-Stack Workflows", fg="bright_cyan", bold=True)
     click.secho("                        v1.0", fg="bright_white", bold=True)
     click.secho("=" * 60, fg="bright_blue", bold=True)
 
-
 class ColoredGroup(click.Group):
     """Custom Click Group that shows banner and colored help."""
-    
     def format_help(self, ctx, formatter):
         show_banner()
         click.secho("\nAvailable Commands:", fg="bright_yellow", bold=True)
@@ -64,7 +64,6 @@ def cli():
 # Helper function to configure tasks dynamically
 def configure_task(i, interactive, allowed_task_types, tasks):
     click.secho(f"\nConfiguring Task {i+1}...", fg="bright_yellow", bold=True)
-    
     if interactive:
         task_type = click.prompt(
             click.style(f"Task {i+1} type", fg="bright_blue"),
@@ -92,18 +91,15 @@ def configure_task(i, interactive, allowed_task_types, tasks):
     if task_type == "LLM" and interactive:
         task["prompt_template"] = click.prompt(click.style(f"Task {i+1} LLM prompt", fg="bright_blue"), default="")
     elif task_type in ["GET", "POST", "PUT"] and interactive:
-        if click.confirm(click.style(f"Add input source for task {i+1}?", fg="bright_blue"), default=False):
-            task["input_source"] = click.prompt(click.style(f"Task {i+1} input source (e.g., URL, DB string)", fg="bright_blue"), default="")
+        if click.confirm(click.style(f"Add input source or inputs for task {i+1}?", fg="bright_blue"), default=False):
+            if click.confirm(click.style(f"Use an input source (e.g., URL, DB string)?", fg="bright_blue"), default=False):
+                task["input_source"] = click.prompt(click.style(f"Task {i+1} input source", fg="bright_blue"), default="")
+            if click.confirm(click.style(f"Add inputs from other tasks?", fg="bright_blue"), default=False):
+                input_ids = click.prompt(click.style(f"Task {i+1} input task IDs (comma-separated)", fg="bright_blue"), default="")
+                task["inputs"] = [int(x.strip()) for x in input_ids.split(",") if x.strip()]
     elif task_type == "LOCAL" and interactive:
         if click.confirm(click.style(f"Use trigger_logs for task {i+1}?", fg="bright_blue"), default=False):
             task["output_collection"] = "trigger_logs"
-    
-    if interactive and click.confirm(click.style(f"Add inputs for task {i+1}?", fg="bright_blue"), default=False):
-        input_ids = click.prompt(click.style(f"Task {i+1} input task IDs (comma-separated)", fg="bright_blue"), default="")
-        task["inputs"] = [int(x.strip()) for x in input_ids.split(",") if x.strip()]
-    
-    if interactive and not task["input_source"] and click.confirm(click.style(f"Add input source for task {i+1}?", fg="bright_blue"), default=False):
-        task["input_source"] = click.prompt(click.style(f"Task {i+1} input source (e.g., URL, DB string)", fg="bright_blue"), default="")
     
     if interactive and click.confirm(click.style(f"Add parameters for task {i+1}?", fg="bright_blue"), default=False):
         params_str = click.prompt(click.style(f"Task {i+1} parameters (YAML)", fg="bright_blue"), default="{}")
@@ -113,12 +109,12 @@ def configure_task(i, interactive, allowed_task_types, tasks):
         except yaml.YAMLError:
             click.secho("Invalid YAML, using empty parameters", fg="red")
             task["parameters"] = {}
-        if click.confirm(click.style(f"Add max_wait_seconds for task {i+1}?", fg="bright_blue"), default=False):
+        if "max_wait_seconds" not in task["parameters"] and click.confirm(click.style(f"Add max_wait_seconds for task {i+1}?", fg="bright_blue"), default=False):
             task["parameters"]["max_wait_seconds"] = click.prompt(click.style("Max wait seconds", fg="bright_blue"), type=int, default=300)
-        if click.confirm(click.style(f"Add timeout for task {i+1}?", fg="bright_blue"), default=False):
+        if "timeout" not in task["parameters"] and click.confirm(click.style(f"Add timeout for task {i+1}?", fg="bright_blue"), default=False):
             task["parameters"]["timeout"] = click.prompt(click.style("Task timeout (seconds)", fg="bright_blue"), type=int, default=30)
     
-    if interactive and click.confirm(click.style(f"Add cron for task {i+1}?", fg="bright_blue"), default=False):
+    if interactive and click.confirm(click.style(f"Add cron schedule for task {i+1}?", fg="bright_blue"), default=False):
         task["cron"] = click.prompt(click.style(f"Task {i+1} cron schedule", fg="bright_blue"), default="")
     
     tasks.append(task)
@@ -129,6 +125,7 @@ def configure_task(i, interactive, allowed_task_types, tasks):
 @click.option('--interactive/--no-interactive', default=True, help='Enable interactive prompts')
 def init(file, interactive):
     """Initialize a new pipeline with a JSON schema and MongoDB setup."""
+    global mongod_process
     show_banner()
     click.secho("\nInitializing New Pipeline...", fg="bright_yellow", bold=True)
 
@@ -180,6 +177,16 @@ def init(file, interactive):
     except Exception as e:
         click.secho(f"✗ MongoDB setup failed: {e}", fg="red", bold=True)
         return
+    finally:
+        # Cleanup: Terminate mongod process if it was started
+        if mongod_process and mongod_process.poll() is None:
+            mongod_process.terminate()
+            try:
+                mongod_process.wait(timeout=5)
+                click.secho("✓ Local MongoDB instance terminated.", fg="bright_green", bold=True)
+            except subprocess.TimeoutExpired:
+                mongod_process.kill()
+                click.secho("✓ Local MongoDB instance forcefully terminated.", fg="bright_green", bold=True)
 
     # Task configuration
     tasks = []
@@ -257,6 +264,20 @@ def init(file, interactive):
         json.dump(schema, f, indent=2)
     
     click.secho(f"✓ Pipeline initialized: {schema_path}", fg="bright_green", bold=True)
+    
+    # Automatically push the initial schema to MongoDB
+    try:
+        with schema_path.open("r") as f:
+            schema = json.load(f)
+        client = get_mongo_client(config["uri"])
+        db_name = config["db_name"]
+        validate_schema(schema)
+        push_schema(client, db_name, schema)
+        click.secho(f"✓ Initial schema {pipeline_id} pushed to MongoDB.", fg="bright_green", bold=True)
+    except ValueError as e:
+        click.secho(f"✗ Validation error during push: {e}", fg="red", bold=True)
+    except Exception as e:
+        click.secho(f"✗ Push error: {e}", fg="red", bold=True)
 
 @cli.command()
 @click.option('--file', type=click.Path(exists=True), required=True, help='Path to schema file')
@@ -580,7 +601,7 @@ def schema_version(pipeline_id, type):
                 json.dump(schema, f, indent=2)
             click.secho(f"✓ Updated schema version to {new_version} for {pipeline_id}.", fg="bright_green", bold=True)
         else:
-            click.secho(f"✗ Schema file not found for {pipeline_id}.", fg="red", bold=True)
+            click.secho(f"✗ Schema file not added for {pipeline_id}.", fg="red", bold=True)
             sys.exit(1)
     except Exception as e:
         click.secho(f"✗ Error: {e}", fg="red", bold=True)
