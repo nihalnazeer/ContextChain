@@ -3,9 +3,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
-from app.db.mongo_client import get_mongo_client
-from app.registry.schema_loader import load_schema
-from app.engine.executor import execute_pipeline, execute_single_task
+from contextchain.db.mongo_client import get_mongo_client
+from contextchain.registry.schema_loader import load_schema
+from contextchain.engine.executor import execute_pipeline, execute_single_task
 from pathlib import Path
 import yaml
 import logging
@@ -121,4 +121,6 @@ async def update_version(pipeline_id: str, type: str = "patch"):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    config_path = Path("config/default_config.yaml")
+    api_port = config.get("api_port", 8000) if config_path.exists() and config else 8000
+    uvicorn.run(app, host="0.0.0.0", port=api_port)

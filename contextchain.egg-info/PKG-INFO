@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: contextchain
-Version: 0.2.2
+Version: 0.3.6
 Summary: A pipeline execution framework with MongoDB integration
 Author-email: Nihal Nazeer <Nhaal160@gmail.com>
 License: MIT

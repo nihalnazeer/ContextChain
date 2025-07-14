@@ -1,11 +1,9 @@
-# app/registry/schema_loader.py
-import json
 import os
 from typing import Dict, Any
 import logging
 from contextchain.engine.validator import validate_schema
-from contextchain.engine.registry import registry
 from .version_manager import VersionManager
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -27,8 +25,6 @@ class SchemaLoader:
             with open(file_path, 'r') as f:
                 schema = json.load(f)
             validate_schema(schema)
-            version = self.version_manager.get_version(schema)
-            registry.register(schema["pipeline_id"], schema, version)
             return True
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in {file_path}: {str(e)}")
@@ -51,22 +47,15 @@ class SchemaLoader:
 
 def load_schema(client, db_name: str, pipeline_id: str, version: str = None) -> Dict[str, Any]:
     """Load a schema from MongoDB based on pipeline ID and optional version."""
-    vm = VersionManager()
-    vm.client = client
-    vm.db = client[db_name]
+    vm = VersionManager(client, db_name)
     versions = vm.list_versions(pipeline_id)
     if not versions:
         logger.error(f"No versions found for pipeline {pipeline_id}")
         return None
     if version:
-        target_version = next((v for v in versions if v["version"] == version), None)
+        target_version = next((v for v in versions if v["schema_version"] == version), None)
         if not target_version:
             logger.error(f"Version {version} not found for pipeline {pipeline_id}")
             return None
         return target_version["schema"]
-    return versions[0]["schema"]  # Return latest version by default
-
-# Example usage
-if __name__ == "__main__":
-    loader = SchemaLoader()
-    loader.load_all()
+    return next(v["schema"] for v in versions if v.get("is_latest", False)) or versions[0]["schema"]  # Return latest or first
