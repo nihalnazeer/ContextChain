@@ -284,7 +284,7 @@ if __name__ == "__main__":
             },
             "llm_config": {
                 "url": "https://openrouter.ai/api/v1/chat/completions",
-                "api_key": "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",  # Direct key
+                "api_key": "",  # Direct key
                 "api_key_env": "OPENROUTER_API_KEY",  # Optional env variable
                 "model": "mistralai/mistral-small-3.2-24b-instruct:free"
             }
