@@ -1,13 +1,21 @@
+#!/usr/bin/env python3
 import json
 from typing import Dict, List, Any
 from urllib.parse import urlparse
+import logging
 
-def validate_schema(schema: Dict[str, Any]) -> None:
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def validate_schema(schema: Dict[str, Any], is_initial: bool = False) -> None:
     """
     Validate the entire schema structure and its tasks.
     Raises ValueError with detailed error messages if validation fails.
+    Args:
+        schema (Dict[str, Any]): The schema to validate.
+        is_initial (bool): Flag indicating if this is the initial schema creation (no duplicate check).
     """
-    print(f"Validating schema: {schema}")  # Debug: Print the entire schema
+    logger.debug(f"Validating schema: {schema}")  # Debug: Log the entire schema
     if not isinstance(schema, dict):
         raise ValueError("Schema must be a dictionary")
 
@@ -30,7 +38,6 @@ def validate_schema(schema: Dict[str, Any]) -> None:
     validate_tasks(schema["tasks"], schema)
 
     validate_global_config(schema["global_config"])
-
     validate_metadata(schema["metadata"])
 
 def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
@@ -39,7 +46,7 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
     """
     task_ids = set()
     for task in tasks:
-        print(f"Validating task: {task}")  # Debug: Print each task
+        logger.debug(f"Validating task: {task}")  # Debug: Log each task
         if not isinstance(task, dict):
             raise ValueError("Each task must be a dictionary")
 
@@ -67,11 +74,12 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
         if "inputs" in task and task["inputs"]:
             if not isinstance(task["inputs"], list):
                 raise ValueError(f"Task {task['task_id']} inputs must be a list")
-            for input_id in task["inputs"]:
-                if not isinstance(input_id, int):
-                    raise ValueError(f"Task {task['task_id']} input {input_id} must be an integer")
-                if input_id not in task_ids or input_id >= task["task_id"]:
-                    raise ValueError(f"Task {task['task_id']} references non-existent or future input task {input_id}")
+            for input_ref in task["inputs"]:
+                if not (isinstance(input_ref, int) or isinstance(input_ref, str)):
+                    raise ValueError(f"Task {task['task_id']} input {input_ref} must be an integer or string")
+                if isinstance(input_ref, int):
+                    if input_ref not in task_ids or input_ref >= task["task_id"]:
+                        raise ValueError(f"Task {task['task_id']} references non-existent or future input task {input_ref}")
 
         if "input_mapping" in task and task["input_mapping"]:
             if not isinstance(task["input_mapping"], list):
@@ -99,9 +107,26 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
             if backend_hosts and task["target_host"] not in backend_hosts:
                 raise ValueError(f"Task {task['task_id']} target_host '{task['target_host']}' not found in backend_hosts")
 
-        if "input_source" in task and task["input_source"]:
-            if not isinstance(task["input_source"], str) or not task["input_source"].strip():
-                raise ValueError(f"Task {task['task_id']} input_source must be a non-empty string")
+        if "input_source" in task and task["input_source"] is not None:
+            if not (isinstance(task["input_source"], str) or isinstance(task["input_source"], list)):
+                raise ValueError(f"Task {task['task_id']} input_source must be a string or list")
+            if isinstance(task["input_source"], list):
+                if not task["input_source"] or len(task["input_source"]) != len(task.get("inputs", [])):
+                    raise ValueError(f"Task {task['task_id']} input_source list must match inputs length")
+                for source in task["input_source"]:
+                    if not isinstance(source, str) or not source.strip():
+                        raise ValueError(f"Task {task['task_id']} input_source list items must be non-empty strings")
+            else:
+                if not task["input_source"].strip():
+                    raise ValueError(f"Task {task['task_id']} input_source must be a non-empty string")
+
+        if "wait_for_input" in task:
+            if not isinstance(task["wait_for_input"], bool):
+                raise ValueError(f"Task {task['task_id']} wait_for_input must be a boolean")
+
+        if "output_collection" in task:
+            if not isinstance(task["output_collection"], str) or not task["output_collection"].strip():
+                raise ValueError(f"Task {task['task_id']} output_collection must be a non-empty string")
 
         if "parameters" in task and task["parameters"]:
             if not isinstance(task["parameters"], dict):
@@ -113,6 +138,15 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
                     raise ValueError(f"Task {task['task_id']} max_wait_seconds must be positive")
                 if key == "timeout" and value <= 0:
                     raise ValueError(f"Task {task['task_id']} timeout must be positive")
+                if task["task_type"] == "LOCAL" and key == "granularity":
+                    if not isinstance(value, (int, str)):
+                        raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer or string")
+                elif not isinstance(value, (int, str, bool)):
+                    raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer, string, or boolean")
+
+        if "rerun" in task:
+            if not isinstance(task["rerun"], (type(None), bool)):
+                raise ValueError(f"Task {task['task_id']} rerun must be a boolean or null")
 
         if task["task_type"] == "LLM" and "endpoint" not in task and ("prompt_template" not in task or not task["prompt_template"]):
             raise ValueError(f"Task {task['task_id']} (LLM) requires a prompt_template when not using an endpoint")
@@ -120,9 +154,6 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
         if task["task_type"] == "LLM" and "model" in task:
             if not isinstance(task["model"], str) or not task["model"].strip():
                 raise ValueError(f"Task {task['task_id']} model must be a non-empty string")
-
-        if "output_collection" in task and not isinstance(task["output_collection"], str):
-            raise ValueError(f"Task {task['task_id']} output_collection must be a string")
 
         if "cron" in task and task["cron"]:
             if not isinstance(task["cron"], str) or not task["cron"].strip():
@@ -132,7 +163,7 @@ def validate_global_config(config: Dict[str, Any]) -> None:
     """
     Validate the global configuration.
     """
-    required_fields = ["default_output_db", "logging_level", "retry_on_failure", "max_retries", "allowed_task_types", "allowed_domains"]
+    required_fields = ["default_output_db", "logging_level", "retry_on_failure", "max_retries", "allowed_task_types", "allowed_domains", "backend_host", "llm_config"]
     missing_fields = [field for field in required_fields if field not in config]
     if missing_fields:
         raise ValueError(f"Missing required global_config fields: {', '.join(missing_fields)}")
@@ -163,30 +194,14 @@ def validate_global_config(config: Dict[str, Any]) -> None:
         if not isinstance(domain, str) or not domain.strip():
             raise ValueError("allowed_domains must contain non-empty strings")
 
-    if "backend_host" in config:
-        if not isinstance(config["backend_host"], str) or not config["backend_host"].strip():
-            raise ValueError("backend_host must be a non-empty string")
-        try:
-            result = urlparse(config["backend_host"])
-            if not all([result.scheme, result.netloc]):
-                raise ValueError("backend_host must be a valid URL with scheme and netloc (e.g., http://127.0.0.1:8000)")
-        except ValueError as e:
-            raise ValueError(f"backend_host validation failed: {str(e)}")
-
-    if "backend_hosts" in config:
-        if not isinstance(config["backend_hosts"], dict):
-            raise ValueError("backend_hosts must be a dictionary")
-        for host_key, host_value in config["backend_hosts"].items():
-            if not isinstance(host_key, str) or not host_key.strip():
-                raise ValueError(f"backend_hosts key '{host_key}' must be a non-empty string")
-            if not isinstance(host_value, str) or not host_value.strip():
-                raise ValueError(f"backend_hosts value for '{host_key}' must be a non-empty string")
-            try:
-                result = urlparse(host_value)
-                if not all([result.scheme, result.netloc]):
-                    raise ValueError(f"backend_hosts value for '{host_key}' must be a valid URL with scheme and netloc")
-            except ValueError as e:
-                raise ValueError(f"backend_hosts value for '{host_key}' validation failed: {str(e)}")
+    if not isinstance(config["backend_host"], str) or not config["backend_host"].strip():
+        raise ValueError("backend_host must be a non-empty string")
+    try:
+        result = urlparse(config["backend_host"])
+        if not all([result.scheme, result.netloc]):
+            raise ValueError("backend_host must be a valid URL with scheme and netloc (e.g., http://127.0.0.1:8000)")
+    except ValueError as e:
+        raise ValueError(f"backend_host validation failed: {str(e)}")
 
     if "llm_config" in config:
         if not isinstance(config["llm_config"], dict):
@@ -236,65 +251,8 @@ def validate_metadata(metadata: Dict[str, Any]) -> None:
             raise ValueError("linked_pipelines must contain non-empty strings")
 
 if __name__ == "__main__":
-    sample_schema = {
-        "pipeline_id": "test_pipeline",
-        "schema_version": "v1.0.0",
-        "description": "Test pipeline",
-        "created_by": "user",
-        "created_at": "2025-07-09T23:39:00Z",
-        "tasks": [
-            {
-                "task_id": 1,
-                "description": "Fetch data",
-                "task_type": "GET",
-                "endpoint": "http://example.com/data",
-                "inputs": [],
-                "input_mapping": [],
-                "target_host": "default"
-            },
-            {
-                "task_id": 2,
-                "description": "Generate summary",
-                "task_type": "LLM",
-                "endpoint": "services.custom_llm.generate_summary",
-                "inputs": [1],
-                "input_mapping": [{"source": "task_results", "key": "data", "task_id": 1}],
-                "parameters": {"output_file": "summary.txt"}
-            },
-            {
-                "task_id": 3,
-                "description": "Generate LLM summary",
-                "task_type": "LLM",
-                "prompt_template": "Summarize {data}: {insights}",
-                "inputs": [1],
-                "input_mapping": [{"source": "task_results", "key": "data", "task_id": 1}],
-                "model": "mistralai/mixtral-8x7b-instruct"
-            }
-        ],
-        "global_config": {
-            "default_output_db": "test_db",
-            "logging_level": "INFO",
-            "retry_on_failure": True,
-            "max_retries": 2,
-            "allowed_task_types": ["GET", "LLM", "LOCAL", "HTTP"],
-            "allowed_domains": ["example.com"],
-            "backend_hosts": {
-                "default": "http://127.0.0.1:8000",
-                "external": "https://example.com"
-            },
-            "llm_config": {
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "api_key": "",  # Direct key
-                "api_key_env": "OPENROUTER_API_KEY",  # Optional env variable
-                "model": "mistralai/mistral-small-3.2-24b-instruct:free"
-            }
-        },
-        "metadata": {
-            "tags": ["test", "data"],
-            "pipeline_type": "fullstack-ai",
-            "linked_pipelines": []
-        }
-    }
+    with open("/Users/mohammednihal/Desktop/Business Intelligence/AgentBI/Backend/schemas/AgentBI-Demo.json", "r") as f:
+        sample_schema = json.load(f)
     try:
         validate_schema(sample_schema)
         print("Schema is valid!")

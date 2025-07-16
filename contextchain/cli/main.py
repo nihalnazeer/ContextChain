@@ -5,21 +5,25 @@ import json
 import yaml
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import os
+import stat
+import logging
 from contextchain.engine.validator import validate_schema
 from contextchain.engine.executor import execute_pipeline, execute_single_task
-from contextchain.registry.version_manager import push_schema, list_versions, rollback_version
+from contextchain.registry.version_manager import push_schema, list_versions, rollback_version, VersionManager
 from contextchain.registry.schema_loader import load_schema
 from contextchain.db.mongo_client import get_mongo_client
 from contextchain.db.collections import setup_collections
-import subprocess
-import os
+from dotenv import load_dotenv
 import time
-import stat
+import shutil
 
-# Global variable to track the mongod process
-mongod_process = None
+# Load environment variables from .env file
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
-# Force colorama initialization for better color support
+# Load colorama for better color support
 try:
     import colorama
     colorama.init()
@@ -54,8 +58,9 @@ def update_current_schema(client, db_name, pipeline_id, version=None):
     """Update the current_schema.json with the latest or specified schema version."""
     schema = load_schema(client, db_name, pipeline_id, version)
     if schema:
-        current_schema_path = Path("schemas/current_schema.json")
-        current_schema_path.parent.mkdir(exist_ok=True)
+        schema_dir = Path(f"schemas/{pipeline_id}")
+        schema_dir.mkdir(parents=True, exist_ok=True)
+        current_schema_path = schema_dir / "current_schema.json"
         meta = {
             "_meta": {
                 "pipeline_id": pipeline_id,
@@ -64,15 +69,39 @@ def update_current_schema(client, db_name, pipeline_id, version=None):
             },
             "schema": schema
         }
-        if not current_schema_path.exists() or os.access(current_schema_path, os.W_OK):
-            with current_schema_path.open("w") as f:
-                json.dump(meta, f, indent=2)
-            current_schema_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-            click.secho(f"✓ Updated current_schema.json for {pipeline_id} (version: {schema.get('schema_version', 'v0.0.0')})", fg="bright_green", bold=True)
-        else:
-            click.secho(f"✓ current_schema.json for {pipeline_id} is read-only, no update performed.", fg="bright_green", bold=True)
+        try:
+            if not current_schema_path.exists():
+                with current_schema_path.open("w") as f:
+                    json.dump(meta, f, indent=2)
+                current_schema_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            elif os.access(current_schema_path, os.W_OK):
+                with current_schema_path.open("w") as f:
+                    json.dump(meta, f, indent=2)
+                current_schema_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            else:
+                click.secho(f"✗ current_schema.json for {pipeline_id} is read-only. Attempting to fix permissions...", fg="yellow", bold=True)
+                os.chmod(current_schema_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                with current_schema_path.open("w") as f:
+                    json.dump(meta, f, indent=2)
+        except PermissionError:
+            click.secho(f"✗ Failed to update current_schema.json for {pipeline_id} due to permissions. Please run 'chmod u+w {current_schema_path}' manually.", fg="red", bold=True)
+            return
+        click.secho(f"✓ Updated current_schema.json for {pipeline_id} (version: {schema.get('schema_version', 'v0.0.0')})", fg="bright_green", bold=True)
     else:
         click.secho(f"✗ No schema found for {pipeline_id}", fg="red", bold=True)
+
+def copy_schema_file(pipeline_id, old_version, new_version):
+    """Create a backup copy of the schema file with a timestamp suffix without overwriting the original."""
+    source_path = Path(f"schemas/{pipeline_id}/{new_version}.json")
+    if source_path.exists():
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_path = source_path.with_name(f"{source_path.stem}.{timestamp}{source_path.suffix}")
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, backup_path)
+        backup_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        click.secho(f"✓ Created backup schema: {backup_path} (version: {new_version})", fg="bright_green", bold=True)
+    else:
+        click.secho(f"✗ Source file {source_path} not found for backup.", fg="red", bold=True)
 
 class ColoredGroup(click.Group):
     """Custom Click Group that shows banner and colored help."""
@@ -88,57 +117,32 @@ class ColoredGroup(click.Group):
 
         click.secho("\n  Initialization:", fg="bright_green", bold=True)
         click.secho("    init          Initialize a new pipeline with a JSON schema and MongoDB setup.", fg="bright_cyan")
-        click.secho("                  Options:", fg="bright_cyan")
-        click.secho("                    --file PATH          Output path for schema (optional)", fg="bright_cyan")
-        click.secho("                    --interactive/--no-interactive  Enable interactive prompts (default: True)", fg="bright_cyan")
-        click.secho("                    --backend-host URL   Backend host (e.g., http://127.0.0.1:8000) (optional)", fg="bright_cyan")
-        click.secho("                    --frontend-host URL  Frontend host (e.g., http://127.0.0.1:3636) (optional)", fg="bright_cyan")
+        click.secho("    new-version   Create a new schema version based on semantic versioning (local copy only).", fg="bright_cyan")
 
         click.secho("\n  Schema Management:", fg="bright_green", bold=True)
         click.secho("    schema-compile  Validate a schema file.", fg="bright_cyan")
-        click.secho("                    Required: --file PATH", fg="bright_cyan")
         click.secho("    schema-push     Push a schema to MongoDB with versioning.", fg="bright_cyan")
-        click.secho("                    Required: --file PATH", fg="bright_cyan")
         click.secho("    schema-pull     Pull a schema from MongoDB.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id", fg="bright_cyan")
-        click.secho("                    Optional: --version", fg="bright_cyan")
-        click.secho("    schema-version  Create or update a schema version for a pipeline.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id", fg="bright_cyan")
-        click.secho("                    Optional: --type (major, minor, patch)", fg="bright_cyan")
         click.secho("    schema-current  Display the current schema version.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id", fg="bright_cyan")
         click.secho("    version-list    List schema versions for a pipeline.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id", fg="bright_cyan")
         click.secho("    version-rollback  Rollback to a previous schema version.", fg="bright_cyan")
-        click.secho("                      Required: --pipeline_id, --version", fg="bright_cyan")
 
         click.secho("\n  Execution:", fg="bright_green", bold=True)
         click.secho("    run            Run an entire pipeline.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id", fg="bright_cyan")
-        click.secho("                    Optional: --version", fg="bright_cyan")
-        click.secho("                    Optional: --backend-host URL   Override backend host (e.g., http://127.0.0.1:8000)", fg="bright_cyan")
-        click.secho("                    Optional: --frontend-host URL  Override frontend host (e.g., http://127.0.0.1:3636)", fg="bright_cyan")
         click.secho("    run-task       Run a single task for development.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id, --task_id", fg="bright_cyan")
-        click.secho("                    Optional: --version", fg="bright_cyan")
 
         click.secho("\n  Collaboration:", fg="bright_green", bold=True)
         click.secho("    ccshare-init    Initialize a .ccshare file for collaborative MongoDB Atlas access.", fg="bright_cyan")
         click.secho("    ccshare-join    Join an existing .ccshare collaboration.", fg="bright_cyan")
-        click.secho("                    Required: --uri", fg="bright_cyan")
         click.secho("    ccshare-status  Check the status of the .ccshare configuration.", fg="bright_cyan")
 
         click.secho("\n  Utilities:", fg="bright_green", bold=True)
         click.secho("    list-pipelines  List all pipelines in MongoDB.", fg="bright_cyan")
         click.secho("    logs            Display logs for a pipeline.", fg="bright_cyan")
-        click.secho("                    Required: --pipeline_id", fg="bright_cyan")
         click.secho("    results         Display results for a specific task.", fg="bright_cyan")
-        click.secho("                    Required: --task_id", fg="bright_cyan")
 
         click.secho("\nNotes:", fg="bright_yellow", bold=True)
         click.secho("  - Use 'contextchain COMMAND --help' for detailed options of each command.", fg="bright_cyan")
-        click.secho("  - PATH should be a valid file path (e.g., /path/to/schema.json).", fg="bright_cyan")
-        click.secho("  - Version numbers follow semantic versioning (e.g., v0.1.0).", fg="bright_cyan")
 
 @click.group(cls=ColoredGroup, context_settings={"help_option_names": ["-h", "--help"]})
 def cli():
@@ -168,7 +172,8 @@ def configure_task(i, interactive, allowed_task_types, tasks):
         "output_collection": "task_results",
         "prompt_template": None,
         "parameters": {},
-        "cron": None
+        "cron": None,
+        "rerun": None  # New field with default None
     }
     
     if task_type == "LLM" and interactive:
@@ -188,12 +193,15 @@ def configure_task(i, interactive, allowed_task_types, tasks):
     elif task_type == "LOCAL" and interactive:
         if click.confirm(click.style(f"Use trigger_logs for task {i+1}?", fg="bright_blue"), default=False):
             task["output_collection"] = "trigger_logs"
+        if click.confirm(click.style(f"Add granularity for task {i+1}?", fg="bright_blue"), default=False):
+            granularity = click.prompt(click.style(f"Task {i+1} granularity (e.g., monthly, quarterly, or integer)", fg="bright_blue"), default="monthly")
+            task["parameters"]["granularity"] = granularity
     
     if interactive and click.confirm(click.style(f"Add parameters for task {i+1}?", fg="bright_blue"), default=False):
         params_str = click.prompt(click.style(f"Task {i+1} parameters (YAML)", fg="bright_blue"), default="{}")
         try:
             params = yaml.safe_load(params_str)
-            task["parameters"] = params or {}
+            task["parameters"].update(params or {})
         except yaml.YAMLError:
             click.secho("Invalid YAML, using empty parameters", fg="red")
             task["parameters"] = {}
@@ -205,17 +213,23 @@ def configure_task(i, interactive, allowed_task_types, tasks):
     if interactive and click.confirm(click.style(f"Add cron schedule for task {i+1}?", fg="bright_blue"), default=False):
         task["cron"] = click.prompt(click.style(f"Task {i+1} cron schedule", fg="bright_blue"), default="")
     
+    if interactive and click.confirm(click.style(f"Enable rerun for task {i+1} to overwrite existing results?", fg="bright_blue"), default=False):
+        task["rerun"] = True
+        click.secho("✓ Rerun enabled for task. Existing results will be overwritten with previous data preserved.", fg="bright_green")
+    else:
+        task["rerun"] = None
+
     tasks.append(task)
     return tasks
 
 @cli.command()
 @click.option('--file', type=click.Path(), help='Output path for schema')
 @click.option('--interactive/--no-interactive', default=True, help='Enable interactive prompts')
-@click.option('--backend-host', default="http://127.0.0.1:8000", help='Backend host URL (e.g., http://127.0.0.1:8000)')
-@click.option('--frontend-host', default="http://127.0.0.1:3636", help='Frontend host URL (e.g., http://127.0.0.1:3636)')
+@click.option('--backend-host', default="http://127.0.0.1:8000", help='Backend host URL')
+@click.option('--frontend-host', default="http://127.0.0.1:3636", help='Frontend host URL')
 def init(file, interactive, backend_host, frontend_host):
     """Initialize a new pipeline with a JSON schema and MongoDB setup."""
-    global mongod_process
+    mongod_process = None
     show_banner()
     click.secho("\nInitializing New Pipeline...", fg="bright_yellow", bold=True)
 
@@ -223,21 +237,20 @@ def init(file, interactive, backend_host, frontend_host):
     description = click.prompt(click.style("Description", fg="bright_blue"), default="") if interactive else ""
     created_by = click.prompt(click.style("Creator name", fg="bright_blue"), default="user") if interactive else "user"
 
-    # Optional advanced metadata
     if interactive and click.confirm(click.style("Add optional metadata? (tags, pipeline type)", fg="bright_blue"), default=False):
-        tags_input = click.prompt(click.style("Tags (comma-separated, e.g., fullstack,llm)", fg="bright_blue"), default="")
+        tags_input = click.prompt(click.style("Tags (comma-separated)", fg="bright_blue"), default="")
         tags = [tag.strip() for tag in tags_input.split(",") if tag.strip()]
         pipeline_type = click.prompt(click.style("Pipeline type", fg="bright_blue"), default="fullstack-ai")
     else:
         tags = []
         pipeline_type = "fullstack-ai"
 
-    # MongoDB setup with retry loop
     config = {}
     max_attempts = 3
     attempt = 1
     while attempt <= max_attempts:
-        mode = click.prompt(click.style(f"MongoDB mode (1: Default (local), 2: .ccshare) (attempt {attempt}/{max_attempts})", fg="bright_blue"), type=click.Choice(["1", "2"]), default="1") if interactive else "1"
+        mode = click.prompt(click.style(f"MongoDB mode (1: Default (local), 2: .ccshare) (attempt {attempt}/{max_attempts})", fg="bright_blue"), 
+                           type=click.Choice(["1", "2"]), default="1") if interactive else "1"
         
         if mode == "2":
             ccshare_path = click.prompt(click.style("Path to .ccshare file", fg="bright_blue"), default="config/team.ccshare")
@@ -245,7 +258,7 @@ def init(file, interactive, backend_host, frontend_host):
                 with open(ccshare_path, 'r') as f:
                     ccshare = yaml.safe_load(f)
                 if not ccshare or "uri" not in ccshare:
-                    click.secho(f"✗ Invalid or missing 'uri' in {ccshare_path}. Please check the file.", fg="red", bold=True)
+                    click.secho(f"✗ Invalid or missing 'uri' in {ccshare_path}.", fg="red", bold=True)
                     if attempt == max_attempts:
                         return
                     continue
@@ -263,7 +276,7 @@ def init(file, interactive, backend_host, frontend_host):
                     return
                 continue
         else:
-            config["uri"] = f"mongodb://localhost:27017/{pipeline_id}"
+            config["uri"] = "mongodb://localhost:27017"
             config["db_name"] = pipeline_id
 
         config_path = Path("config/default_config.yaml")
@@ -273,26 +286,26 @@ def init(file, interactive, backend_host, frontend_host):
         
         click.secho("Setting up MongoDB connection...", fg="bright_yellow")
         try:
-            client = get_mongo_client(config["uri"])
+            client = get_mongo_client(config["uri"], db_name=config["db_name"])
             setup_collections(client, config["db_name"])
             click.secho("MongoDB setup completed.", fg="bright_green", bold=True)
             break
         except Exception as e:
             click.secho(f"✗ Failed to connect to MongoDB at {config['uri']}: {str(e)}", fg="red", bold=True)
             if attempt == max_attempts:
-                click.secho("✗ Max retry attempts reached. Please fix the configuration and try again.", fg="red", bold=True)
+                click.secho("✗ Max retry attempts reached. Please ensure MongoDB is installed and running, or use .ccshare mode.", fg="red", bold=True)
                 return
             attempt += 1
             if "mongodb://localhost" in config["uri"]:
-                click.secho("Attempting to start a local MongoDB instance...", fg="bright_yellow")
+                click.secho("Attempting to start local MongoDB...", fg="bright_yellow")
                 try:
-                    mongod_process = subprocess.Popen(["mongod"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    time.sleep(2)
-                    client = get_mongo_client(f"mongodb://localhost:27017/{pipeline_id}")
-                    setup_collections(client, pipeline_id)
-                    config["uri"] = f"mongodb://localhost:27017/{pipeline_id}"
-                    with config_path.open("w") as f:
-                        yaml.safe_dump(config, f)
+                    data_dir = Path("/data/db")
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    os.chmod(data_dir, 0o755)
+                    mongod_process = subprocess.Popen(["mongod", "--dbpath", str(data_dir)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    time.sleep(3)
+                    client = get_mongo_client(config["uri"], db_name=config["db_name"])
+                    setup_collections(client, config["db_name"])
                     click.secho("✓ Local MongoDB instance started and setup completed.", fg="bright_green", bold=True)
                     break
                 except Exception as local_e:
@@ -305,7 +318,7 @@ def init(file, interactive, backend_host, frontend_host):
                             mongod_process.kill()
                     continue
 
-    if mongod_process and mongod_process.poll() is None and f"mongodb://localhost:27017/{pipeline_id}" not in config["uri"]:
+    if mongod_process and mongod_process.poll() is None and f"mongodb://localhost:27017" not in config["uri"]:
         mongod_process.terminate()
         try:
             mongod_process.wait(timeout=5)
@@ -328,11 +341,11 @@ def init(file, interactive, backend_host, frontend_host):
                     break
         else:
             json_path = click.prompt(click.style("Path to JSON file for tasks", fg="bright_blue"), default="tasks.json")
-            schema_dir = Path("ccschema")
-            schema_dir.mkdir(exist_ok=True)
+            schema_dir = Path(f"schemas/{pipeline_id}")
+            schema_dir.mkdir(parents=True, exist_ok=True)
             full_path = schema_dir / json_path
             if not full_path.exists():
-                default_tasks = [{"task_id": 1, "description": "Default Task", "task_type": "LOCAL", "endpoint": "path.to.function"}]
+                default_tasks = [{"task_id": 1, "description": "Default Task", "task_type": "LOCAL", "endpoint": "path.to.function", "rerun": None}]
                 with full_path.open("w") as f:
                     json.dump({"tasks": default_tasks}, f, indent=2)
                 click.secho(f"✓ Created default task file: {full_path}", fg="bright_green", bold=True)
@@ -349,12 +362,12 @@ def init(file, interactive, backend_host, frontend_host):
     llm_config = {}
     if any(task["task_type"] == "LLM" for task in tasks) and interactive:
         if click.confirm(click.style("Configure LLM settings for this pipeline?", fg="bright_blue"), default=False):
-            llm_config["url"] = click.prompt(click.style("LLM API URL (e.g., https://openrouter.ai/api/v1/chat/completions)", fg="bright_blue"), default="")
-            llm_config["api_key_env"] = click.prompt(click.style("Environment variable for API key (e.g., OPENROUTER_API_KEY, leave empty if using direct key)", fg="bright_blue"), default="OPENROUTER_API_KEY", show_default=True)
-            llm_config["api_key"] = click.prompt(click.style("Direct API key (optional, leave empty if using env variable)", fg="bright_blue"), default="", show_default=True) if not llm_config["api_key_env"] else ""
-            llm_config["model"] = click.prompt(click.style("LLM model (e.g., mistralai/mistral-small-3.2-24b-instruct:free)", fg="bright_blue"), default="mistralai/mistral-small-3.2-24b-instruct:free")
-            llm_config["referer"] = click.prompt(click.style("Referer URL (e.g., http://your-site-url.com)", fg="bright_blue"), default="http://your-site-url.com")
-            llm_config["title"] = click.prompt(click.style("X-Title (e.g., Your Site Name)", fg="bright_blue"), default="Your Site Name")
+            llm_config["url"] = click.prompt(click.style("LLM API URL", fg="bright_blue"))
+            llm_config["api_key_env"] = click.prompt(click.style("Environment variable for API key", fg="bright_blue"), default="OPENROUTER_API_KEY")
+            llm_config["api_key"] = click.prompt(click.style("Direct API key (optional)", fg="bright_blue"), default="") if not llm_config["api_key_env"] else ""
+            llm_config["model"] = click.prompt(click.style("LLM model", fg="bright_blue"))
+            llm_config["referer"] = click.prompt(click.style("Referer URL", fg="bright_blue"), default="http://your-site-url.com")
+            llm_config["title"] = click.prompt(click.style("X-Title", fg="bright_blue"), default="Your Site Name")
 
     schema = {
         "pipeline_id": pipeline_id,
@@ -377,11 +390,13 @@ def init(file, interactive, backend_host, frontend_host):
         "metadata": {
             "tags": tags,
             "pipeline_type": pipeline_type,
-            "linked_pipelines": []
+            "linked_pipelines": [],
+            "status": "draft",
+            "parent_version": None
         }
     }
     
-    if interactive and click.confirm(click.style("Configure advanced settings? (logging, retries, domains)", fg="bright_blue"), default=False):
+    if interactive and click.confirm(click.style("Configure advanced settings?", fg="bright_blue"), default=False):
         logging_level = click.prompt(click.style("Logging level", fg="bright_blue"), default="INFO", type=click.Choice(["INFO", "DEBUG", "WARNING", "ERROR"]))
         retry_on_failure = click.confirm(click.style("Retry on failure?", fg="bright_blue"), default=True)
         max_retries = click.prompt(click.style("Max retries", fg="bright_blue"), type=int, default=2)
@@ -396,10 +411,10 @@ def init(file, interactive, backend_host, frontend_host):
         })
 
     try:
-        client = get_mongo_client(config["uri"])
+        client = get_mongo_client(config["uri"], db_name=config["db_name"])
         db_name = config["db_name"]
-        validate_schema(schema)
-        push_schema(client, db_name, schema)
+        validate_schema(schema, is_initial=True)
+        push_schema(client, db_name, schema, is_initial=True)
         click.secho(f"✓ Initial schema {pipeline_id} validated and pushed to MongoDB.", fg="bright_green", bold=True)
         update_current_schema(client, db_name, pipeline_id)
     except ValueError as e:
@@ -409,12 +424,86 @@ def init(file, interactive, backend_host, frontend_host):
         click.secho(f"✗ Push error: {e}", fg="red", bold=True)
         return
 
-    schema_path = Path(file) if file else Path(f"schemas/{pipeline_id}.json")
-    schema_path.parent.mkdir(exist_ok=True)
+    schema_dir = Path(f"schemas/{pipeline_id}")
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    schema_path = Path(file) if file else schema_dir / f"v0.1.0.json"
     with schema_path.open("w") as f:
         json.dump(schema, f, indent=2)
-    
+    schema_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
     click.secho(f"✓ Pipeline initialized: {schema_path}", fg="bright_green", bold=True)
+
+@cli.command()
+@click.option('--pipeline-id', required=True, help='Pipeline ID')
+def new_version(pipeline_id):
+    """Create a new schema version based on semantic versioning (local copy only)."""
+    show_banner()
+    click.secho(f"\nCreating New Version for Pipeline {pipeline_id}...", fg="bright_yellow", bold=True)
+    try:
+        config_path = Path("config/default_config.yaml")
+        if not config_path.exists():
+            click.secho(f"✗ Config file {config_path} not found. Please run 'init' first.", fg="red", bold=True)
+            return
+        with config_path.open("r") as f:
+            config = yaml.safe_load(f)
+        client = get_mongo_client(config["uri"])
+        db_name = config["db_name"]
+        versions = list_versions(client, db_name, pipeline_id)
+        
+        if not versions:
+            click.secho(f"✗ No versions found for {pipeline_id}. Starting with v0.1.0.", fg="red", bold=True)
+            latest_version = "v0.0.0"
+        else:
+            latest_version = max(versions, key=lambda x: [int(i) for i in x['schema_version'].replace('v', '').split('.')])['schema_version']
+
+        click.secho(f"Current version: {latest_version}", fg="bright_blue")
+        bump_type = click.prompt(
+            click.style("Select version bump:", fg="bright_blue"),
+            type=click.Choice(["1", "2", "3"]),
+            show_choices=True,
+            prompt_suffix="\n1. patch   - Fixes or small changes (e.g. v0.4.3)\n"
+                         "2. minor   - Add new task(s) or non-breaking config changes (e.g. v0.5.0)\n"
+                         "3. major   - Breaking changes, redesign, removal (e.g. v1.0.0)\n> "
+        )
+        
+        latest_nums = [int(i) for i in latest_version.replace('v', '').split('.')]
+        if bump_type == "1":  # patch
+            latest_nums[2] += 1
+        elif bump_type == "2":  # minor
+            latest_nums[1] += 1
+            latest_nums[2] = 0
+        else:  # major
+            latest_nums[0] += 1
+            latest_nums[1] = 0
+            latest_nums[2] = 0
+            breaking_changes = click.prompt(click.style("What breaking changes are you introducing? (description)", fg="bright_blue"), default="")
+
+        new_version = f"v{latest_nums[0]}.{latest_nums[1]}.{latest_nums[2]}"
+        
+        schema = load_schema(client, db_name, pipeline_id, latest_version)
+        if not schema:
+            click.secho(f"✗ No schema found for version {latest_version}.", fg="red", bold=True)
+            return
+        
+        schema["schema_version"] = new_version
+        schema["created_at"] = datetime.utcnow().isoformat() + "Z"
+        schema["created_by"] = os.getenv("USER", "unknown")
+        schema["metadata"]["parent_version"] = latest_version
+        schema["metadata"]["status"] = "draft"
+        schema["metadata"]["changelog"] = [f"Auto-generated new version {new_version}"]
+        if bump_type == "3" and breaking_changes:
+            schema["metadata"]["changelog"].append(f"Breaking changes: {breaking_changes}")
+
+        schema_dir = Path(f"schemas/{pipeline_id}")
+        schema_dir.mkdir(parents=True, exist_ok=True)
+        schema_path = schema_dir / f"{new_version}.json"
+        with schema_path.open("w") as f:
+            json.dump(schema, f, indent=2)
+        schema_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        click.secho(f"✓ New schema version {new_version} created locally: {schema_path}", fg="bright_green", bold=True)
+
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
+        return
 
 @cli.command()
 @click.option('--file', type=click.Path(exists=True), required=True, help='Path to schema file')
@@ -447,9 +536,10 @@ def schema_push(file):
         client = get_mongo_client(config["uri"])
         db_name = config["db_name"]
         validate_schema(schema)
-        push_schema(client, db_name, schema, increment=True)
-        click.secho(f"✓ Schema {schema['pipeline_id']} pushed to MongoDB with incremented version.", fg="bright_green", bold=True)
+        push_schema(client, db_name, schema)
+        click.secho(f"✓ Schema {schema['pipeline_id']} pushed to MongoDB with version {schema['schema_version']}.", fg="bright_green", bold=True)
         update_current_schema(client, db_name, schema["pipeline_id"])
+        copy_schema_file(schema["pipeline_id"], schema["metadata"].get("parent_version", "v0.0.0"), schema["schema_version"])
     except ValueError as e:
         click.secho(f"✗ Validation error: {e}", fg="red", bold=True)
         sys.exit(1)
@@ -460,9 +550,7 @@ def schema_push(file):
 @cli.command()
 @click.option('--pipeline_id', required=True, help='Pipeline ID')
 @click.option('--version', help='Schema version (default: latest)')
-@click.option('--backend-host', default=None, help='Override backend host URL (e.g., http://127.0.0.1:8000)')
-@click.option('--frontend-host', default=None, help='Override frontend host URL (e.g., http://127.0.0.1:3636)')
-def run(pipeline_id, version, backend_host, frontend_host):
+def run(pipeline_id, version):
     """Run an entire pipeline."""
     click.secho(f"\nRunning Pipeline {pipeline_id}...", fg="bright_yellow", bold=True)
     try:
@@ -475,12 +563,6 @@ def run(pipeline_id, version, backend_host, frontend_host):
         if not schema:
             click.secho(f"✗ Pipeline {pipeline_id} not found.", fg="red", bold=True)
             sys.exit(1)
-
-        if backend_host:
-            schema["global_config"]["backend_host"] = backend_host
-        if frontend_host:
-            schema["global_config"]["frontend_host"] = frontend_host
-
         execute_pipeline(client, db_name, schema)
         click.secho(f"✓ Pipeline {pipeline_id} executed successfully.", fg="bright_green", bold=True)
     except Exception as e:
@@ -676,8 +758,9 @@ def schema_pull(pipeline_id, version):
         db_name = config["db_name"]
         schema = load_schema(client, db_name, pipeline_id, version)
         if schema:
-            schema_path = Path(f"schemas/{pipeline_id}.json")
-            schema_path.parent.mkdir(exist_ok=True)
+            schema_dir = Path(f"schemas/{pipeline_id}")
+            schema_dir.mkdir(parents=True, exist_ok=True)
+            schema_path = schema_dir / f"{pipeline_id}.json"
             with schema_path.open("w") as f:
                 json.dump(schema, f, indent=2)
             click.secho(f"✓ Schema pulled: {schema_path}", fg="bright_green", bold=True)
@@ -705,67 +788,6 @@ def list_pipelines():
                 click.secho(f"  • {pipeline}", fg="bright_cyan")
         else:
             click.secho("No pipelines found.", fg="bright_yellow")
-    except Exception as e:
-        click.secho(f"✗ Error: {e}", fg="red", bold=True)
-        return
-
-@cli.command()
-@click.option('--pipeline_id', required=True, help='Pipeline ID')
-@click.option('--type', type=click.Choice(['major', 'minor', 'patch']), default='patch', help='Version increment type')
-def schema_version(pipeline_id, type):
-    """Create or update a schema version for a pipeline."""
-    click.secho(f"\nUpdating Schema Version for Pipeline {pipeline_id}...", fg="bright_yellow", bold=True)
-    try:
-        config_path = Path("config/default_config.yaml")
-        with config_path.open("r") as f:
-            config = yaml.safe_load(f)
-        client = get_mongo_client(config["uri"])
-        db_name = config["db_name"]
-        versions = list_versions(client, db_name, pipeline_id)
-        if not versions:
-            click.secho(f"✗ No versions found for {pipeline_id}. Starting with v1.0.0.", fg="red", bold=True)
-            new_version = "v1.0.0"
-        else:
-            latest_version = max(versions, key=lambda x: [int(i) for i in x['schema_version'].replace('v', '').split('.')])
-            latest_nums = [int(i) for i in latest_version['schema_version'].replace('v', '').split('.')]
-            if type == 'major':
-                latest_nums[0] += 1
-                latest_nums[1] = 0
-                latest_nums[2] = 0
-            elif type == 'minor':
-                latest_nums[1] += 1
-                latest_nums[2] = 0
-            else:
-                latest_nums[2] += 1
-            new_version = f"v{latest_nums[0]}.{latest_nums[1]}.{latest_nums[2]}"
-        
-        schema_path = Path(f"schemas/{pipeline_id}.json")
-        if schema_path.exists():
-            with schema_path.open("r") as f:
-                schema = json.load(f)
-            schema["schema_version"] = new_version
-            with schema_path.open("w") as f:
-                json.dump(schema, f, indent=2)
-            click.secho(f"✓ Updated schema version to {new_version} for {pipeline_id}.", fg="bright_green", bold=True)
-        else:
-            click.secho(f"✗ Schema file not added for {pipeline_id}.", fg="red", bold=True)
-            return
-    except Exception as e:
-        click.secho(f"✗ Error: {e}", fg="red", bold=True)
-        return
-
-@cli.command()
-@click.option('--pipeline_id', required=True, help='Pipeline ID')
-def schema_current(pipeline_id):
-    """Display the current schema version."""
-    click.secho(f"\nDisplaying Current Schema for Pipeline {pipeline_id}...", fg="bright_yellow", bold=True)
-    try:
-        config_path = Path("config/default_config.yaml")
-        with config_path.open("r") as f:
-            config = yaml.safe_load(f)
-        client = get_mongo_client(config["uri"])
-        db_name = config["db_name"]
-        update_current_schema(client, db_name, pipeline_id)
     except Exception as e:
         click.secho(f"✗ Error: {e}", fg="red", bold=True)
         return
