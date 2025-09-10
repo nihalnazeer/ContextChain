@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: contextchain
-Version: 0.5.5
-Summary: A pipeline execution framework with MongoDB integration
+Version: 1.1.4
+Summary: A pipeline execution framework with MongoDB and ChromaDB integration for AI workflows
 Author-email: Nihal Nazeer <Nhaal160@gmail.com>
 License: MIT
 Project-URL: Homepage, https://github.com/nihalnazeer/contextchain
@@ -17,13 +17,20 @@ Classifier: Operating System :: OS Independent
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
 License-File: LICENSE
-Requires-Dist: pymongo>=4.13.2
-Requires-Dist: requests>=2.32.4
-Requires-Dist: pydantic>=2.11.7
+Requires-Dist: pymongo>=4.8.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: pydantic>=2.0.0
 Requires-Dist: urllib3<2
 Requires-Dist: python-dotenv>=1.0.0
-Requires-Dist: click
-Requires-Dist: pyyaml
+Requires-Dist: click>=8.0.0
+Requires-Dist: pyyaml>=6.0.0
+Requires-Dist: colorama>=0.4.6
+Requires-Dist: chromadb>=0.5.0
+Requires-Dist: sentence-transformers>=3.0.0
+Requires-Dist: networkx>=3.0
+Requires-Dist: torch==2.3.0
+Requires-Dist: torchaudio==2.3.0
+Requires-Dist: torchvision==0.18.0
 Dynamic: license-file
 
 # ContextChain

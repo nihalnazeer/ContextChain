@@ -5,12 +5,20 @@ import json
 import os
 from typing import Dict, List, Any
 from contextchain.db.mongo_client import get_mongo_client
+from contextchain.db.vector_db_client import get_vector_db_client
 from contextchain.engine.validator import validate_schema
+from contextchain.local_llm_client import OllamaClient
+from contextchain.data_processing import chunk_text, summarize_text
+from contextchain.dag_builder import build_dag
+from contextchain.evaluation import evaluate_results
+from contextchain.task_registry import get_task_handler
 from datetime import datetime
 import time
 import importlib
 from urllib.parse import urlparse, urljoin
 from pymongo import UpdateOne
+import concurrent.futures
+import networkx as nx
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -25,13 +33,13 @@ def fetch_inputs(task: Dict[str, Any], db: Any, schema: Dict[str, Any]) -> Dict[
                 source_task = next((t for t in schema["tasks"] if t["task_id"] == input_ref), None)
                 if source_task:
                     source_coll = source_task.get("output_collection", "task_results")
-                    data = db[source_coll].find_one(sort=[("timestamp", -1)])
+                    data = db[source_coll].find_one({"task_id": input_ref}, sort=[("timestamp", -1)])
                     inputs[f"task_{input_ref}"] = data.get("output", {}) if data else {}
             elif isinstance(input_ref, str):  # Named input
                 source_coll = task.get("input_source")
                 if source_coll and isinstance(source_coll, (str, list)):
                     if isinstance(source_coll, list):
-                        source_coll = source_coll[0]  # Use first source for now, enhance if needed
+                        source_coll = source_coll[0]  # Use first source for now
                     data = db[source_coll].find_one(sort=[("timestamp", -1)])
                     inputs[input_ref] = data.get(input_ref) if data else None
     return inputs
@@ -109,8 +117,10 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
     """Execute a single task based on its type."""
     output_collection = task.get("output_collection", "task_results")
     result = {}
+    parameters = task.get("parameters", {})
+
     if task["task_type"] == "LLM":
-        prompt = task.get("prompt_template", "").format(**task.get("parameters", {}))
+        prompt = task.get("prompt_template", "").format(**parameters)
         result = execute_llm_request(schema["global_config"]["llm_config"], prompt, task.get("model"))
     elif task["task_type"] == "LOCAL":
         module, func = task["endpoint"].rsplit(".", 1)
@@ -132,6 +142,57 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
             backend_host = schema["global_config"]["backend_hosts"].get(task.get("target_host", "default"), schema["global_config"].get("backend_host", "http://127.0.0.1:8000"))
             full_url = urljoin(backend_host, full_url.lstrip("/"))
         result = execute_http_request(full_url, task["task_type"], fetch_inputs(task, db, schema), retries=schema["global_config"]["max_retries"])
+    elif task["task_type"] == "VECTOR_STORE_ADD":
+        vdb_client = get_vector_db_client(schema["global_config"].get("vector_db_config", {}).get("path", "./contextchain_chromadb"))
+        documents = parameters.get("documents", [])
+        metadata = parameters.get("metadata", None)
+        metrics = vdb_client.add_documents(parameters["collection_name"], documents, metadata)
+        result = {"output": metrics, "status": "success"}
+        db["metrics"].insert_one({
+            "pipeline_id": schema["pipeline_id"],
+            "task_id": task["task_id"],
+            "metrics": metrics,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+    elif task["task_type"] == "VECTOR_STORE_SEARCH":
+        vdb_client = get_vector_db_client(schema["global_config"].get("vector_db_config", {}).get("path", "./contextchain_chromadb"))
+        query = parameters.get("query", "")
+        k = parameters.get("k", 5)
+        metrics = vdb_client.search(parameters["collection_name"], query, k)
+        result = {"output": metrics["results"], "status": "success"}
+        db["metrics"].insert_one({
+            "pipeline_id": schema["pipeline_id"],
+            "task_id": task["task_id"],
+            "metrics": {"time_taken": metrics["time_taken"]},
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+    elif task["task_type"] == "CHUNK_TEXT":
+        text = parameters.get("text", "")
+        max_length = parameters.get("max_length", 512)
+        chunks = chunk_text(text, max_length)
+        result = {"output": {"chunks": chunks}, "status": "success"}
+    elif task["task_type"] == "SUMMARIZE":
+        text = parameters.get("text", "")
+        model = schema["global_config"].get("llm_config", {}).get("model", "mistral:7b")
+        summary = summarize_text(text, model)
+        result = {"output": {"summary": summary}, "status": "success"}
+    elif task["task_type"] == "EVALUATE":
+        results = list(db["task_results"].find({"task_id": task["task_id"]}))
+        evaluation = evaluate_results(results)
+        result = {"output": {"evaluation": evaluation}, "status": "success"}
+    elif task["task_type"] == "LLM_GENERATE":
+        llm_client = OllamaClient(model=schema["global_config"].get("llm_config", {}).get("model", "mistral:7b"))
+        prompt = parameters.get("prompt", "")
+        max_tokens = parameters.get("max_tokens", 512)
+        response = llm_client.generate(prompt, max_tokens)
+        result = {"output": {"response": response}, "status": "success"}
+    else:
+        handler = get_task_handler(task["task_type"])
+        if handler:
+            inputs = fetch_inputs(task, db, schema)
+            result = handler(task, schema, inputs)
+        else:
+            raise ValueError(f"Unknown task type: {task['task_type']}")
 
     # Handle rerun logic if enabled
     if task.get("rerun", False):
@@ -151,7 +212,7 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
                 "pipeline_id": schema["pipeline_id"],
                 "schema_version": schema["schema_version"],
                 "task_id": task["task_id"],
-                "timestamp": datetime.now().strftime("%Y-%m-%d_%H:%M"),
+                "timestamp": datetime.utcnow().isoformat() + "Z",
                 "previous_data": previous_data
             })
             db[output_collection].delete_many({
@@ -170,7 +231,7 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
                         "pipeline_id": schema["pipeline_id"],
                         "schema_version": schema["schema_version"],
                         "task_id": task["task_id"],
-                        "timestamp": datetime.now().strftime("%Y-%m-%d_%H:%M"),
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
                         "previous_data": previous_data if not updated_results else {}
                     })
                     db[output_collection].delete_many({
@@ -192,7 +253,7 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
                 "pipeline_id": schema["pipeline_id"],
                 "schema_version": schema["schema_version"],
                 "task_id": task["task_id"],
-                "timestamp": datetime.now().strftime("%Y-%m-%d_%H:%M")
+                "timestamp": datetime.utcnow().isoformat() + "Z"
             })
             db[output_collection].insert_one(updated_result)
             return updated_result
@@ -205,7 +266,7 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
                         "pipeline_id": schema["pipeline_id"],
                         "schema_version": schema["schema_version"],
                         "task_id": task["task_id"],
-                        "timestamp": datetime.now().strftime("%Y-%m-%d_%H:%M")
+                        "timestamp": datetime.utcnow().isoformat() + "Z"
                     })
                     db[output_collection].insert_one(updated_item)
                     updated_results.append(updated_item)
@@ -216,16 +277,19 @@ def execute_task(task: Dict[str, Any], schema: Dict[str, Any], db: Any) -> Dict[
     raise ValueError(f"Unsupported result type {type(result)} for task {task['task_id']}")
 
 def execute_pipeline(client: Any, db_name: str, schema: Dict[str, Any]) -> None:
-    """Execute the entire pipeline and generate resolved schema."""
+    """Execute the entire pipeline with parallel task execution."""
     logger.info(f"Starting pipeline execution for {schema['pipeline_id']}")
     db = client[db_name]
 
     # Validate schema
     validate_schema(schema)
 
-    tasks = sorted(schema["tasks"], key=lambda x: x["task_id"])
+    # Build DAG for parallel execution
+    dag = build_dag(schema["tasks"])
+    tasks = schema["tasks"]
     context = {}  # Store task results by task_id
 
+    # Resolve URLs for HTTP tasks
     resolved_schema = schema.copy()
     for task in tasks:
         task_copy = task.copy()
@@ -239,29 +303,45 @@ def execute_pipeline(client: Any, db_name: str, schema: Dict[str, Any]) -> None:
         resolved_schema["tasks"] = [t for t in resolved_schema["tasks"] if t["task_id"] != task["task_id"]]
         resolved_schema["tasks"].append(task_copy)
 
+    # Save resolved schema
     output_dir = os.path.join("resolved_schema", f"{schema['pipeline_id']}_{schema['schema_version']}.json")
     os.makedirs(os.path.dirname(output_dir), exist_ok=True)
     with open(output_dir, "w") as f:
         json.dump(resolved_schema, f, indent=2)
 
-    # Execute tasks in order, handling dependencies
-    for task in tasks:
-        try:
-            context[task["task_id"]] = execute_task(task, schema, db)
-            logger.info(f"Task {task['task_id']} executed successfully")
-        except Exception as e:
-            logger.error(f"Task {task['task_id']} failed: {str(e)}")
-            if not schema["global_config"]["retry_on_failure"]:
-                raise
-            for _ in range(schema["global_config"]["max_retries"]):
-                try:
-                    context[task["task_id"]] = execute_task(task, schema, db)
-                    break
-                except Exception as e:
-                    logger.error(f"Retry failed for task {task['task_id']}: {str(e)}")
-                    time.sleep(2)
-            else:
-                raise
+    # Execute tasks in parallel
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_to_task = {}
+        for task in tasks:
+            if not list(dag.predecessors(task["task_id"])):  # No dependencies
+                future = executor.submit(execute_task, task, schema, db)
+                future_to_task[future] = task
+
+        for future in concurrent.futures.as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                context[task["task_id"]] = future.result()
+                logger.info(f"Task {task['task_id']} executed successfully")
+                # Schedule dependent tasks
+                for successor in dag.successors(task["task_id"]):
+                    successor_task = next(t for t in tasks if t["task_id"] == successor)
+                    if all(pred in context for pred in dag.predecessors(successor)):
+                        future = executor.submit(execute_task, successor_task, schema, db)
+                        future_to_task[future] = successor_task
+            except Exception as e:
+                logger.error(f"Task {task['task_id']} failed: {str(e)}")
+                if not schema["global_config"]["retry_on_failure"]:
+                    raise
+                for _ in range(schema["global_config"]["max_retries"]):
+                    try:
+                        context[task["task_id"]] = execute_task(task, schema, db)
+                        logger.info(f"Task {task['task_id']} retry succeeded")
+                        break
+                    except Exception as retry_e:
+                        logger.error(f"Retry failed for task {task['task_id']}: {str(retry_e)}")
+                        time.sleep(2)
+                else:
+                    raise
 
     logger.info(f"Pipeline {schema['pipeline_id']} execution completed")
 

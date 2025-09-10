@@ -19,6 +19,18 @@ from dotenv import load_dotenv
 import time
 import shutil
 
+# New imports for updated features
+from contextchain.db.vector_db_client import ChromaClient  # New module for vector DB
+from contextchain.local_llm_client import OllamaClient  # New module for local LLM
+from contextchain.data_processing import chunk_text, summarize_text  # New module for data processing
+from contextchain.dag_builder import build_dag  # New module for DAG and parallelism
+from contextchain.evaluation import evaluate_results  # New module for evaluation
+from contextchain.task_registry import register_task  # New module for plugin architecture
+import networkx as nx  # For DAGs
+import chromadb  # For vector DB
+import sentence_transformers  # For embeddings
+# Note: Ollama is assumed to be installed and running externally; no direct import needed.
+
 # Load environment variables from .env file
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -140,6 +152,19 @@ class ColoredGroup(click.Group):
         click.secho("    list-pipelines  List all pipelines in MongoDB.", fg="bright_cyan")
         click.secho("    logs            Display logs for a pipeline.", fg="bright_cyan")
         click.secho("    results         Display results for a specific task.", fg="bright_cyan")
+
+        click.secho("\n  Vector DB Commands:", fg="bright_green", bold=True)
+        click.secho("    vector         Vector DB operations (init, search, etc.).", fg="bright_cyan")
+
+        click.secho("\n  LLM Commands:", fg="bright_green", bold=True)
+        click.secho("    llm            Local LLM operations (setup, etc.).", fg="bright_cyan")
+
+        click.secho("\n  Metrics and Evaluation:", fg="bright_green", bold=True)
+        click.secho("    metrics        Display metrics for a pipeline.", fg="bright_cyan")
+        click.secho("    evaluate       Evaluate results for a task.", fg="bright_cyan")
+
+        click.secho("\n  Plugins:", fg="bright_green", bold=True)
+        click.secho("    plugin         Manage plugins (register, etc.).", fg="bright_cyan")
 
         click.secho("\nNotes:", fg="bright_yellow", bold=True)
         click.secho("  - Use 'contextchain COMMAND --help' for detailed options of each command.", fg="bright_cyan")
@@ -791,6 +816,110 @@ def list_pipelines():
     except Exception as e:
         click.secho(f"✗ Error: {e}", fg="red", bold=True)
         return
+
+# New CLI Groups and Commands
+
+@cli.group()
+def vector():
+    """Vector DB operations."""
+    pass
+
+@vector.command()
+@click.option('--collection', required=True, help='Collection name')
+def init(collection):
+    """Initialize a vector DB collection."""
+    click.secho(f"\nInitializing Vector DB Collection {collection}...", fg="bright_yellow", bold=True)
+    try:
+        client = ChromaClient()  # Assuming default path from config
+        client.create_collection(collection)
+        click.secho(f"✓ Vector DB collection {collection} initialized.", fg="bright_green", bold=True)
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
+
+@vector.command()
+@click.option('--collection', required=True, help='Collection name')
+@click.option('--query', required=True, help='Search query')
+def search(collection, query):
+    """Search in a vector DB collection."""
+    click.secho(f"\nSearching in Vector DB Collection {collection}...", fg="bright_yellow", bold=True)
+    try:
+        client = ChromaClient()
+        results = client.search(collection, query)
+        click.secho(f"Results: {results}", fg="bright_green", bold=True)
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
+
+@cli.group()
+def llm():
+    """Local LLM operations."""
+    pass
+
+@llm.command()
+@click.option('--model', required=True, help='LLM model name')
+def setup(model):
+    """Setup a local LLM model."""
+    click.secho(f"\nSetting up LLM Model {model}...", fg="bright_yellow", bold=True)
+    try:
+        client = OllamaClient(model=model)
+        client.setup()  # Pull and initialize model
+        click.secho(f"✓ LLM model {model} setup completed.", fg="bright_green", bold=True)
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
+
+@cli.command()
+@click.option('--pipeline_id', required=True, help='Pipeline ID')
+def metrics(pipeline_id):
+    """Display metrics for a pipeline."""
+    click.secho(f"\nDisplaying Metrics for Pipeline {pipeline_id}...", fg="bright_yellow", bold=True)
+    try:
+        config_path = Path("config/default_config.yaml")
+        with config_path.open("r") as f:
+            config = yaml.safe_load(f)
+        client = get_mongo_client(config["uri"])
+        db_name = config["db_name"]
+        metrics_data = list(client[db_name]["metrics"].find({"pipeline_id": pipeline_id}))
+        if metrics_data:
+            click.secho(f"Found {len(metrics_data)} metric entries:", fg="bright_green")
+            for metric in metrics_data:
+                click.secho(f"  • {metric}", fg="bright_blue")
+        else:
+            click.secho(f"No metrics found for {pipeline_id}.", fg="bright_yellow")
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
+
+@cli.command()
+@click.option('--task_id', type=int, required=True, help='Task ID')
+def evaluate(task_id):
+    """Evaluate results for a task."""
+    click.secho(f"\nEvaluating Task {task_id}...", fg="bright_yellow", bold=True)
+    try:
+        config_path = Path("config/default_config.yaml")
+        with config_path.open("r") as f:
+            config = yaml.safe_load(f)
+        client = get_mongo_client(config["uri"])
+        db_name = config["db_name"]
+        results = list(client[db_name]["task_results"].find({"task_id": task_id}))
+        evaluation = evaluate_results(results)
+        click.secho(f"Evaluation: {evaluation}", fg="bright_green", bold=True)
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
+
+@cli.group()
+def plugin():
+    """Manage plugins."""
+    pass
+
+@plugin.command()
+@click.option('--type', required=True, help='Task type')
+@click.option('--handler', required=True, help='Handler function (module.func)')
+def register(type, handler):
+    """Register a custom task plugin."""
+    click.secho(f"\nRegistering Plugin {type}...", fg="bright_yellow", bold=True)
+    try:
+        register_task(type, handler)
+        click.secho(f"✓ Plugin {type} registered with handler {handler}.", fg="bright_green", bold=True)
+    except Exception as e:
+        click.secho(f"✗ Error: {e}", fg="red", bold=True)
 
 if __name__ == "__main__":
     cli()

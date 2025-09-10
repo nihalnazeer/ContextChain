@@ -2,6 +2,7 @@
 import json
 from typing import Dict, List, Any
 from urllib.parse import urlparse
+from pathlib import Path
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -11,11 +12,12 @@ def validate_schema(schema: Dict[str, Any], is_initial: bool = False) -> None:
     """
     Validate the entire schema structure and its tasks.
     Raises ValueError with detailed error messages if validation fails.
+
     Args:
         schema (Dict[str, Any]): The schema to validate.
         is_initial (bool): Flag indicating if this is the initial schema creation (no duplicate check).
     """
-    logger.debug(f"Validating schema: {schema}")  # Debug: Log the entire schema
+    logger.debug(f"Validating schema: {schema}")
     if not isinstance(schema, dict):
         raise ValueError("Schema must be a dictionary")
 
@@ -45,12 +47,17 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
     Validate the list of tasks and their dependencies.
     """
     task_ids = set()
+    allowed_task_types = [
+        "GET", "POST", "PUT", "LLM", "LOCAL", "HTTP",
+        "VECTOR_STORE_ADD", "VECTOR_STORE_SEARCH", "CHUNK_TEXT",
+        "SUMMARIZE", "EVALUATE", "LLM_GENERATE"
+    ]
     for task in tasks:
-        logger.debug(f"Validating task: {task}")  # Debug: Log each task
+        logger.debug(f"Validating task: {task}")
         if not isinstance(task, dict):
             raise ValueError("Each task must be a dictionary")
 
-        required_task_fields = ["task_id", "description", "task_type", "endpoint"]
+        required_task_fields = ["task_id", "description", "task_type"]
         missing_fields = [field for field in required_task_fields if field not in task]
         if missing_fields:
             raise ValueError(f"Task {task.get('task_id', 'unknown')} is missing required fields: {', '.join(missing_fields)}")
@@ -64,12 +71,37 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
         if not isinstance(task["description"], str) or not task["description"].strip():
             raise ValueError(f"Task {task['task_id']} description must be a non-empty string")
 
-        allowed_task_types = ["GET", "POST", "PUT", "LLM", "LOCAL", "HTTP"]
         if task["task_type"] not in allowed_task_types:
             raise ValueError(f"Task {task['task_id']} task_type must be one of {', '.join(allowed_task_types)}")
 
-        if not isinstance(task["endpoint"], str) or not task["endpoint"].strip():
-            raise ValueError(f"Task {task['task_id']} endpoint must be a non-empty string")
+        # Task-specific validations
+        if task["task_type"] in ["GET", "POST", "PUT", "HTTP", "LLM"]:
+            if "endpoint" not in task or not isinstance(task["endpoint"], str) or not task["endpoint"].strip():
+                raise ValueError(f"Task {task['task_id']} ({task['task_type']}) endpoint must be a non-empty string")
+
+        if task["task_type"] in ["VECTOR_STORE_ADD", "VECTOR_STORE_SEARCH"]:
+            if "parameters" not in task or not isinstance(task["parameters"], dict):
+                raise ValueError(f"Task {task['task_id']} ({task['task_type']}) requires a parameters dictionary")
+            if "collection_name" not in task["parameters"] or not isinstance(task["parameters"]["collection_name"], str):
+                raise ValueError(f"Task {task['task_id']} ({task['task_type']}) requires a non-empty string collection_name in parameters")
+            if task["task_type"] == "VECTOR_STORE_ADD":
+                if "documents" not in task["parameters"] or not isinstance(task["parameters"]["documents"], list):
+                    raise ValueError(f"Task {task['task_id']} (VECTOR_STORE_ADD) requires a list of documents in parameters")
+            elif task["task_type"] == "VECTOR_STORE_SEARCH":
+                if "query" not in task["parameters"] or not isinstance(task["parameters"]["query"], str):
+                    raise ValueError(f"Task {task['task_id']} (VECTOR_STORE_SEARCH) requires a string query in parameters")
+
+        if task["task_type"] in ["CHUNK_TEXT", "SUMMARIZE"]:
+            if "parameters" not in task or not isinstance(task["parameters"], dict):
+                raise ValueError(f"Task {task['task_id']} ({task['task_type']}) requires a parameters dictionary")
+            if "text" not in task["parameters"] or not isinstance(task["parameters"]["text"], str):
+                raise ValueError(f"Task {task['task_id']} ({task['task_type']}) requires a string text in parameters")
+
+        if task["task_type"] == "LLM_GENERATE":
+            if "parameters" not in task or not isinstance(task["parameters"], dict):
+                raise ValueError(f"Task {task['task_id']} (LLM_GENERATE) requires a parameters dictionary")
+            if "prompt" not in task["parameters"] or not isinstance(task["parameters"]["prompt"], str):
+                raise ValueError(f"Task {task['task_id']} (LLM_GENERATE) requires a string prompt in parameters")
 
         if "inputs" in task and task["inputs"]:
             if not isinstance(task["inputs"], list):
@@ -132,17 +164,17 @@ def validate_tasks(tasks: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
             if not isinstance(task["parameters"], dict):
                 raise ValueError(f"Task {task['task_id']} parameters must be a dictionary")
             for key, value in task["parameters"].items():
-                if key in ["max_wait_seconds", "timeout"] and not isinstance(value, int):
-                    raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer")
-                if key == "max_wait_seconds" and value <= 0:
-                    raise ValueError(f"Task {task['task_id']} max_wait_seconds must be positive")
-                if key == "timeout" and value <= 0:
-                    raise ValueError(f"Task {task['task_id']} timeout must be positive")
+                if key in ["max_wait_seconds", "timeout", "max_tokens", "k"]:
+                    if not isinstance(value, int):
+                        raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer")
+                    if value <= 0:
+                        raise ValueError(f"Task {task['task_id']} parameter {key} must be positive")
                 if task["task_type"] == "LOCAL" and key == "granularity":
                     if not isinstance(value, (int, str)):
                         raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer or string")
-                elif not isinstance(value, (int, str, bool)):
-                    raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer, string, or boolean")
+                elif key not in ["max_wait_seconds", "timeout", "granularity", "collection_name", "documents", "metadata", "query", "text", "prompt", "max_tokens", "k"]:
+                    if not isinstance(value, (int, str, bool, list, dict)):
+                        raise ValueError(f"Task {task['task_id']} parameter {key} must be an integer, string, boolean, list, or dict")
 
         if "rerun" in task:
             if not isinstance(task["rerun"], (type(None), bool)):
@@ -163,7 +195,7 @@ def validate_global_config(config: Dict[str, Any]) -> None:
     """
     Validate the global configuration.
     """
-    required_fields = ["default_output_db", "logging_level", "retry_on_failure", "max_retries", "allowed_task_types", "allowed_domains", "backend_host", "llm_config"]
+    required_fields = ["default_output_db", "logging_level", "retry_on_failure", "max_retries", "allowed_task_types", "allowed_domains", "backend_host"]
     missing_fields = [field for field in required_fields if field not in config]
     if missing_fields:
         raise ValueError(f"Missing required global_config fields: {', '.join(missing_fields)}")
@@ -183,7 +215,11 @@ def validate_global_config(config: Dict[str, Any]) -> None:
 
     if not isinstance(config["allowed_task_types"], list):
         raise ValueError("allowed_task_types must be a list")
-    allowed_task_types = ["GET", "POST", "PUT", "LLM", "LOCAL", "HTTP"]
+    allowed_task_types = [
+        "GET", "POST", "PUT", "LLM", "LOCAL", "HTTP",
+        "VECTOR_STORE_ADD", "VECTOR_STORE_SEARCH", "CHUNK_TEXT",
+        "SUMMARIZE", "EVALUATE", "LLM_GENERATE"
+    ]
     for task_type in config["allowed_task_types"]:
         if task_type not in allowed_task_types:
             raise ValueError(f"allowed_task_types contains invalid task type {task_type}")
@@ -203,9 +239,28 @@ def validate_global_config(config: Dict[str, Any]) -> None:
     except ValueError as e:
         raise ValueError(f"backend_host validation failed: {str(e)}")
 
+    # Validate vector_db_config
+    if "vector_db_config" in config:
+        if not isinstance(config["vector_db_config"], dict):
+            raise ValueError("vector_db_config must be a dictionary")
+        if "type" not in config["vector_db_config"] or config["vector_db_config"]["type"] != "chroma":
+            raise ValueError("vector_db_config.type must be 'chroma'")
+        if "path" in config["vector_db_config"]:
+            if not isinstance(config["vector_db_config"]["path"], str) or not config["vector_db_config"]["path"].strip():
+                raise ValueError("vector_db_config.path must be a non-empty string")
+            if not Path(config["vector_db_config"]["path"]).is_dir():
+                logger.warning(f"vector_db_config.path {config['vector_db_config']['path']} does not exist; will be created on initialization")
+
+    # Validate llm_config
     if "llm_config" in config:
         if not isinstance(config["llm_config"], dict):
             raise ValueError("llm_config must be a dictionary")
+        allowed_providers = ["ollama", "openrouter"]
+        if "provider" in config["llm_config"] and config["llm_config"]["provider"] not in allowed_providers:
+            raise ValueError(f"llm_config.provider must be one of {', '.join(allowed_providers)}")
+        if config["llm_config"].get("provider") == "ollama":
+            if "model" not in config["llm_config"] or not isinstance(config["llm_config"]["model"], str):
+                raise ValueError("llm_config.model must be a non-empty string for ollama provider")
         if "url" in config["llm_config"]:
             if not isinstance(config["llm_config"]["url"], str) or not config["llm_config"]["url"].strip():
                 raise ValueError("llm_config.url must be a non-empty string")
