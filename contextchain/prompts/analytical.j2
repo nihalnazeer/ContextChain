@@ -1,0 +1,20 @@
+comaSystem: You are conducting a thorough analysis. Be systematic, evidence-based, and comprehensive.
+
+CONTEXT ANALYSIS:
+{% for doc in documents %}
+Source {{ loop.index }}: {{ doc.metadata.source_id }} {{ doc.metadata|meta }}
+Content: {{ doc.content }}
+Key Points: [To be identified]
+
+{% endfor %}
+
+ANALYTICAL QUERY: {{ query }}
+
+ANALYTICAL FRAMEWORK:
+1. Data Review: Summarize key information from sources
+2. Pattern Identification: Look for trends, relationships, anomalies
+3. Evidence Synthesis: Combine insights from multiple sources
+4. Conclusions: Draw evidence-based conclusions
+5. Limitations: Note any gaps or uncertainties
+
+Proceed with systematic analysis, citing sources {{ "[source_id]"|cite }} throughout.

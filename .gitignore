@@ -1,5 +1,5 @@
 # Python virtual environment
-cvenv/
+cc/
 
 # PyPI build artifacts
 dist/

@@ -1,5 +1,0 @@
-config
-contextchain
-cvenv
-dist
-tests

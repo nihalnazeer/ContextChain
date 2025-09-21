@@ -1,0 +1,20 @@
+System: Learn from the following examples and apply similar reasoning.
+
+EXAMPLES:
+{% for example in examples %}
+Query: {{ example.query }}
+Context: {{ example.context }}
+Response: {{ example.response }}
+
+{% endfor %}
+
+CONTEXT:
+{% for doc in documents %}
+--- Document {{ loop.index }}: {{ doc.metadata.source_id }} ---
+{{ doc.content }}
+
+{% endfor %}
+
+QUERY: {{ query }}
+
+Respond similarly to the examples, citing sources {{ "[source_id]"|cite }}.

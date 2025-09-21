@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextchain"
-version = "0.1.5"
+version = "1.4.0"
 authors = [
     { name = "Nihal Nazeer", email = "Nhaal160@gmail.com" }
 ]
-description = "A pipeline execution framework with MongoDB integration"
+description = "ContextChain v2.0: A pipeline execution framework for adaptive context optimization in LLMs with MongoDB integration"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -27,12 +27,31 @@ dependencies = [
     "requests>=2.32.4",
     "pydantic>=2.11.7",
     "urllib3<2",
-    "python-dotenv>=1.0.0"
+    "python-dotenv>=1.0.0",
+    "numpy>=1.26.0",
+    "torch>=2.0.0",
+    "sentence-transformers>=2.2.2",
+    "scikit-learn>=1.3.0",
+    "faiss-cpu>=1.7.4",
+    "chromadb>=0.4.0",
+    "networkx>=3.1",
+    "jinja2>=3.1.2",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "openai>=1.0.0",
+    "anthropic>=0.3.0",
+    "ollama>=0.1.0",
+    "transformers>=4.35.0",
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/nihalnazeer/contextchain"
 "Bug Tracker" = "https://github.com/nihalnazeer/contextchain/issues"
+"Documentation" = "https://github.com/nihalnazeer/contextchain/blob/main/docs"
 
 [project.scripts]
-contextchain = "app.cli:main"
+contextchain = "contextchain.src:core"
+
+[tool.setuptools.packages.find]
+where = ["contextchain"]
+include = ["contextchain*"]

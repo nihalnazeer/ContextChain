@@ -1,24 +1,51 @@
-annotated-types==0.7.0
-anyio==4.9.0
-certifi==2025.6.15
-charset-normalizer==3.4.2
-click==8.1.8
-dnspython==2.7.0
-exceptiongroup==1.3.0
+# Core FastAPI and async dependencies
 fastapi==0.116.0
-h11==0.16.0
-idna==3.10
-psycopg2-binary==2.9.10  # Replaced psycopg2 with binary version
+uvicorn==0.35.0
 pydantic==2.11.7
 pydantic_core==2.33.2
-pymongo==4.13.2
-PyMySQL==1.1.1
-PyYAML==6.0.2
-requests==2.32.4
-sniffio==1.3.1
+annotated-types==0.7.0
+anyio==4.9.0
 starlette==0.46.2
-typing-inspection==0.4.1
 typing_extensions==4.14.1
+python-dotenv==1.0.1  # For loading .env files
+
+# Database and storage
+pymongo==4.13.2
+dnspython==2.7.0  # For MongoDB SRV connections
+psycopg2-binary==2.9.10  # PostgreSQL async support
+PyMySQL==1.1.1  # MySQL support (if needed)
+PyYAML==6.0.2  # For config files
+
+# HTTP and utilities
+requests==2.32.4
 urllib3<2  # Pinned to avoid NotOpenSSLWarning
-uvicorn==0.35.0
-python-dotenv
+certifi==2025.6.15
+charset-normalizer==3.4.2
+idna==3.10
+click==8.1.8  # For CLI tools if extended
+exceptiongroup==1.3.0  # For async exception handling
+
+# Vector store and embeddings
+sentence-transformers==3.1.1  # For dense embeddings
+chromadb==0.5.11  # Persistent vector store
+faiss-cpu==1.8.0  # CPU version of FAISS for dense search
+scikit-learn==1.5.2  # For TF-IDF sparse encoding
+numpy==2.0.2  # For vector operations
+torch==2.5.1  # For HuggingFace models (optional, but needed for HFLLM)
+
+# LLM backends (optional, install as needed)
+# For OpenAI: openai==1.51.2
+# For Anthropic: anthropic==0.49.0
+# For Ollama: httpx==0.27.2 (already included above)
+# For HuggingFace: transformers==4.46.3 (requires torch)
+
+# DAG and graph
+networkx==3.5  # For dependency graphs in dag.py
+
+# Monitoring and rate limiting
+prometheus-fastapi-instrumentator==6.1.0  # Prometheus metrics
+slowapi==0.1.9  # Rate limiting
+
+# Testing (dev only, optional)
+pytest==8.4.2
+pytest-asyncio==0.24.1

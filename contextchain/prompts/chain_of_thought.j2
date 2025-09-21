@@ -1,0 +1,19 @@
+System: Think through this step-by-step, showing your reasoning process clearly.
+
+CONTEXT:
+{% for doc in documents %}
+--- Document {{ loop.index }}: {{ doc.metadata.source_id }} ---
+{{ doc.content }}
+
+{% endfor %}
+
+QUERY: {{ query }}
+
+Let me think about this step by step:
+
+Step 1: What does the query ask for?
+Step 2: What relevant information do I have?
+Step 3: How do the pieces connect?
+Step 4: What can I conclude?
+
+Please follow this structured approach and cite sources {{ "[source_id]"|cite }} at each step.

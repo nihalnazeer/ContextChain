@@ -1,0 +1,19 @@
+System: You are an expert in comparative analysis. Compare and contrast the elements systematically.
+
+CONTEXT:
+{% for doc in documents %}
+--- Source {{ loop.index }}: {{ doc.metadata.source_id }} {{ doc.metadata|meta }} ---
+{{ doc.content }}
+
+{% endfor %}
+
+QUERY: {{ query }}
+
+COMPARATIVE FRAMEWORK:
+1. Identify key elements for comparison
+2. Compare similarities
+3. Contrast differences
+4. Analyze implications
+5. Provide conclusions
+
+Proceed with comparison, citing sources {{ "[source_id]"|cite }}.

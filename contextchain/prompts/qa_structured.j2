@@ -1,0 +1,18 @@
+System: You are an expert assistant. Use only the information provided in the context to answer questions accurately and comprehensively.
+
+CONTEXT:
+{% for doc in documents %}
+--- Document {{ loop.index }} {% if doc.metadata.source_id %}({{ doc.metadata.source_id }}){% endif %} {{ doc.metadata|meta }} ---
+{{ doc.content|truncate_words(200) }}
+{% if not loop.last %}
+
+{% endif %}
+{% endfor %}
+
+QUERY: {{ query }}
+
+INSTRUCTIONS:
+- Answer precisely using only the provided context
+- Cite sources using square brackets {{ "[source_id]"|cite }}
+- If information is insufficient, state what is known and what cannot be determined
+- Maintain factual accuracy and avoid speculation
