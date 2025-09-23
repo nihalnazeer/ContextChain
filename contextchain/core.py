@@ -21,12 +21,13 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from prometheus_fastapi_instrumentator import Instrumentator
-from .llm import BaseLLMClient, GenerationResult, LLMConfig
+from .llm import BaseLLMClient, GenerationResult, LLMConfig, create_llm_client
 from .storage import IntelligentStorage
 from .acba import AdaptiveContextBudgetingAlgorithm, BudgetAllocation, QueryComplexity
 from .context_engineer import ContextEngineer, PromptStyle, PromptConstructionConfig
 from .vector import HybridVectorStore, VectorStoreConfig
 from .dag import DAGEngine, ExecutionContext
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,11 @@ class ContextChainConfig(BaseModel):
     default_prompt_style: str = "analytical"
     vector_config: Optional[VectorStoreConfig] = None
     llm_config: Optional[LLMConfig] = None
+    llm_provider: str = os.getenv("LLM_PROVIDER", "ollama")
+    llm_model: str = os.getenv("LLM_MODEL", "llama3")
+    llm_api_key: Optional[str] = os.getenv("LLM_API_KEY")
     prompt_config: Optional[PromptConstructionConfig] = None
+    prompt_quality_threshold: float = float(os.getenv("PROMPT_QUALITY_THRESHOLD", "0.5"))
     enable_mongo: bool = False
     mongo_uri: str = "mongodb://localhost:27017/contextchain"
     max_parallel_tasks: int = 5
@@ -82,19 +87,34 @@ class StoreDataRequest(BaseModel):
     data_type: str
     data: Any
     metadata: Optional[Dict] = None
-    destination: Optional[str] = None  # "mongodb" or "postgresql"
+    destination: Optional[str] = None
 
 class FeedbackRequest(BaseModel):
     session_id: str
-    rating: int  # 1-5
+    rating: int
     comments: Optional[str] = None
 
 class ContextChain:
     """Main orchestrator for ContextChain v2.0"""
     def __init__(self, config: ContextChainConfig, llm_client: Optional[BaseLLMClient] = None):
         self.config = config
+        self.llm_optimizer = llm_client or create_llm_client(
+            provider=config.llm_provider,
+            model=config.llm_model,
+            api_key=config.llm_api_key,
+            api_base=config.llm_config.api_base if config.llm_config else None,
+            max_tokens=config.llm_config.max_tokens if config.llm_config else 2048,
+            temperature=config.llm_config.temperature if config.llm_config else 0.7,
+            timeout=config.llm_config.timeout if config.llm_config else 30,
+            enable_streaming=config.llm_config.enable_streaming if config.llm_config else False,
+            enable_caching=config.llm_config.enable_caching if config.llm_config else True,
+            retry_attempts=config.llm_config.retry_attempts if config.llm_config else 3,
+            retry_delay=config.llm_config.retry_delay if config.llm_config else 1.0,
+            device=config.llm_config.device if config.llm_config else "cpu"
+        )
         self.acba = AdaptiveContextBudgetingAlgorithm(max_tokens=config.max_tokens)
-        self.context_engineer = ContextEngineer(config.prompt_config or PromptConstructionConfig())
+        prompt_cfg = config.prompt_config or PromptConstructionConfig(quality_threshold=config.prompt_quality_threshold)
+        self.context_engineer = ContextEngineer(prompt_cfg)
         self.vector_store = HybridVectorStore(config.vector_config or VectorStoreConfig())
         self.dag_engine = DAGEngine(config.max_parallel_tasks)
         self.storage = IntelligentStorage(mongo_uri=config.mongo_uri) if config.enable_mongo else None
@@ -104,8 +124,7 @@ class ContextChain:
             'avg_latency_ms': 0.0,
             'start_time': datetime.utcnow()
         }
-        self.structured_query_cache = {}  # Added for caching structured queries
-        logger.info("ContextChain v2.0 initialized successfully")
+        logger.info(f"ContextChain v2.0 initialized with LLM provider: {config.llm_provider}, model: {config.llm_model}, quality_threshold: {prompt_cfg.quality_threshold}")
 
     async def initialize(self):
         """Initialize components"""
@@ -140,13 +159,11 @@ class ContextChain:
         else:
             return "hybrid"
 
-    @lru_cache(maxsize=100)  # Added caching for structured queries
+    @lru_cache(maxsize=100)
     async def _query_structured_db(self, query: str) -> List[Dict[str, Any]]:
         """Fetch structured historical insights from PostgreSQL (with caching)"""
         logger.info(f"Executing structured query: {query}")
         try:
-            # Placeholder for SQL query logic (e.g., using asyncpg)
-            # In real implementation, replace with actual DB query
             results = []
             if "average" in query.lower():
                 results = [{"metric": "average_sales", "value": 12345.67, "period": "2025-Q3"}]
@@ -185,7 +202,7 @@ class ContextChain:
             
             execution_context = ExecutionContext(session_id=session_id, query=query, raw_data={'documents': documents or []})
             
-            complexity = self.acba.assess_complexity(query)
+            complexity = self.acba.complexity_assessor.assess_complexity(query)
             processing_steps.append({
                 'step': 'complexity_assessment',
                 'status': 'completed',
@@ -208,7 +225,7 @@ class ContextChain:
             elif mode == "vector":
                 retrieved_docs = await self._retrieve_documents(query, execution_context)
                 insight_type = InsightType.HISTORICAL_SEMANTIC.value
-            else:  # hybrid or auto
+            else:
                 docs_structured = await self._query_structured_db(query)
                 docs_semantic = await self._retrieve_documents(query, execution_context)
                 retrieved_docs = docs_structured + docs_semantic
@@ -251,9 +268,7 @@ class ContextChain:
                 query=query,
                 raw_docs=retrieved_docs,
                 budget=budget,
-                complexity=complexity,
-                prompt_style=PromptStyle(self.config.default_prompt_style),
-                semantic_state=final_context.semantic_state
+                complexity=complexity
             )
             processing_steps.append({
                 'step': 'context_engineering',
@@ -292,7 +307,7 @@ class ContextChain:
                 tokens_used=llm_response.tokens_used,
                 tokens_saved=tokens_saved,
                 quality_score=quality_score,
-                budget_allocation=budget.__dict__,
+                budget_allocation=vars(budget),
                 data_routing=data_routing,
                 processing_steps=processing_steps,
                 documents_used=len(retrieved_docs),
@@ -345,7 +360,7 @@ class ContextChain:
 
     def _calculate_tokens_saved(self, documents: List[Dict], budget: BudgetAllocation) -> int:
         """Calculate tokens saved during optimization"""
-        total_possible_tokens = sum(len(str(doc)) for doc in documents) // 4  # Rough token estimation
+        total_possible_tokens = sum(len(str(doc)) for doc in documents) // 4
         return max(0, total_possible_tokens - budget.generation_tokens)
 
     async def _log_interaction(self, query: str, complexity: QueryComplexity, budget: BudgetAllocation,
@@ -362,8 +377,8 @@ class ContextChain:
             await self.storage.log_interaction(
                 session_id=response.session_id,
                 query=query,
-                complexity=complexity.dict(),
-                budget_allocation=budget.dict(),
+                complexity=vars(complexity),
+                budget_allocation=vars(budget),
                 performance_metrics=performance_metrics,
                 success=response.success,
                 error_message=response.error_message
@@ -462,7 +477,6 @@ class ContextChain:
         content = json.dumps(data) if not isinstance(data, str) else data
         routing = {}
         
-        # Use user-specified destination for MongoDB or PostgreSQL
         if destination:
             if destination not in ["mongodb", "postgresql"]:
                 raise ValueError(f"Invalid destination: {destination}. Must be 'mongodb' or 'postgresql'.")
@@ -474,7 +488,6 @@ class ContextChain:
             elif destination == "postgresql":
                 routing["postgresql"] = "handled_by_application"
         else:
-            # Fallback to intelligent routing for metadata
             dest = self.decide_data_destination(data_type, content, metadata)
             if dest == DataDestination.MONGODB and self.storage:
                 doc_id = await self.storage._store_to_mongodb(data_type, content, metadata or {})
@@ -485,7 +498,6 @@ class ContextChain:
                 doc_id = await self.vector_store.index_documents([{"content": content, "metadata": metadata or {}}])
                 routing["vector_db"] = doc_id[0] if doc_id else "none"
         
-        # Store metadata in MongoDB if enabled
         if self.storage:
             meta_id = await self.storage._store_metadata(data_type, content, metadata or {}, destination or dest.value)
             routing["metadata"] = meta_id
@@ -512,10 +524,11 @@ class ContextChain:
     async def close(self):
         """Close resources"""
         if self.storage:
-            self.storage.close()
+            await self.storage.close()
         if hasattr(self.llm_optimizer, 'close'):
             await self.llm_optimizer.close()
-        await self.context_engineer.close()
+        if hasattr(self.context_engineer, 'close'):
+            await self.context_engineer.close()
         await self.dag_engine.close()
         await self.vector_store.close()
 
@@ -530,12 +543,10 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
         version="2.0.0"
     )
     
-    # Rate limiting middleware
     limiter = Limiter(key_func=get_remote_address)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # Add CORS Middleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -544,7 +555,6 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
         allow_headers=["*"],
     )
     
-    # Request logging middleware
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
         logger.info(f"➡️ {request.method} {request.url}")
@@ -553,22 +563,20 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
         logger.info(f"⬅️ {response.status_code} for {request.url} in {(time.time() - start_time) * 1000:.2f}ms")
         return response
     
-    # Lifespan events
     @app.on_event("startup")
     async def startup_event():
         logger.info(f"ContextChain config: {config.dict()}")
         await context_chain.initialize()
+        app.state.contextchain = context_chain
     
     @app.on_event("shutdown")
     async def shutdown_event():
         await context_chain.close()
     
-    # Health check endpoint
     @app.get("/health")
     async def health_check():
         return await context_chain.get_system_status()
     
-    # Metrics endpoint with Prometheus
     @app.get("/metrics")
     async def get_metrics():
         try:
@@ -582,9 +590,8 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
             logger.error(f"Metrics retrieval failed: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
     
-    # Query endpoint with rate limiting
     @app.post("/query")
-    @app.state.limiter.limit("10/minute")  # Rate limit example: 10 requests/min per IP
+    @app.state.limiter.limit("10/minute")
     async def query_insights(request: Request, query: str, context: Optional[str] = None,
                              documents: Optional[List[Dict[str, Any]]] = None,
                              session_id: Optional[str] = None,
@@ -601,13 +608,12 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
             )
             if stream:
                 async def stream_generator():
-                    yield json.dumps(response.dict())  # Stream as JSON chunks if needed
+                    yield json.dumps(response.dict())
                 return StreamingResponse(stream_generator(), media_type="application/json")
             return response
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
-    # Store data endpoint
     @app.post("/store")
     async def store_data(request: StoreDataRequest):
         try:
@@ -621,7 +627,6 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
-    # Index documents endpoint (for Vector DB)
     @app.post("/index")
     async def index_documents(documents: List[Dict[str, Any]]):
         try:
@@ -630,7 +635,6 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
-    # Search context endpoint
     @app.get("/search")
     async def search_context(query: str, k: int = 5, data_type: Optional[str] = None):
         try:
@@ -639,7 +643,6 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
-    # Feedback endpoint
     @app.post("/feedback")
     async def submit_feedback(request: FeedbackRequest):
         try:
@@ -653,8 +656,6 @@ def create_contextchain_app(config: ContextChainConfig = None, llm_client: Optio
             raise HTTPException(status_code=500, detail=str(e))
     
     app.context_chain = context_chain
-    
-    # Instrumentator for Prometheus metrics
     Instrumentator().instrument(app).expose(app)
     
     return app

@@ -7,16 +7,16 @@ Integrates:
 
 Alignment:
 - Compatible with core.py (compute_optimal_budget(query, documents, context), update_with_feedback(budget, performance_metrics, context))
-- Exposes complexity_assessor attribute for direct access
+- Exposes complexity_assessor attribute for direct access. Note: The assess_complexity method is part of the QueryComplexityAssessor class, accessible via self.complexity_assessor.assess_complexity(query), not directly on AdaptiveContextBudgetingAlgorithm.
 - BudgetAllocation fields match llm.py expectations (generation_tokens, retrieval_tokens, compression_tokens)
 - Fixes contextual boost indexing bug; adds decaying exploration and richer rewards
 """
-
+import re
 import numpy as np
 import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple, Optional, Any, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict # <--- FIX: Imported asdict
 from enum import Enum
 import asyncio
 import logging
@@ -80,6 +80,11 @@ class QueryComplexity:
     temporal_complexity: float       # 0-1
     domain_complexity: float         # 0-1
     overall_score: float
+
+    # --- FIX: Added a .to_dict() method using asdict ---
+    def to_dict(self) -> Dict[str, float]:
+        """Converts the dataclass instance to a dictionary."""
+        return asdict(self)
 
 # -------------------------
 # Thompson Sampling Bandit
@@ -423,10 +428,13 @@ class QueryComplexityAssessor:
         q = (query or "").lower()
         semantic = min(len(q.split()) / 20.0, 1.0)
         comp = 0.0
-        for _, indicators in self.complexity_indicators.items():
-            matches = sum(1 for ind in indicators if ind in q)
+        for k, indicators in self.complexity_indicators.items():
+            if k == "temporal":
+                continue
+            matches = sum(1 for ind in indicators if re.search(r'\b{}\b'.format(re.escape(ind)), q))
             if matches > 0:
                 comp += min(matches / 3.0, 0.3)
+
         comp = min(comp, 1.0)
         temporal_matches = sum(1 for ind in self.complexity_indicators["temporal"] if ind in q)
         temporal = min(temporal_matches / 3.0, 1.0)
@@ -443,6 +451,7 @@ class AdaptiveContextBudgetingAlgorithm:
     """
     Joint optimization of retrieval, compression, and generation budgets
     Compatible with ContextChain core orchestrator and LLM optimizer
+    Note: The assess_complexity method is part of the QueryComplexityAssessor class, accessible via self.complexity_assessor.assess_complexity(query), not directly on this class.
     """
 
     def __init__(self, max_tokens: int = 4096, learning_rate: float = 0.01, exploration_rate: float = 0.1):
@@ -638,15 +647,27 @@ async def _simulate_queries(acba: AdaptiveContextBudgetingAlgorithm, n: int = 20
         docs = [{"content": "Lorem ipsum dolor sit amet. " * rng.integers(5, 20)} for _ in range(rng.integers(0, 6))]
         alloc = await acba.compute_optimal_budget(query, docs, context={"query_type": qt})
         # Fake performance: higher reward for matched arms to complexity
-        perf_quality = rng.uniform(0.6, 0.9) if alloc.arm_selected in [BudgetArm.HEAVY_RETRIEVE, BudgetArm.ADAPTIVE_COMPRESS] else rng.uniform(0.4, 0.8)
-        latency_ms = rng.integers(800, 2500)
-        tokens_used = int(alloc.total_budget * rng.uniform(0.7, 1.05))
-        await acba.update_with_feedback(
-            alloc,
-            {"quality": perf_quality, "latency": float(latency_ms), "tokens_used": float(tokens_used)},
-            {"query_type": qt, "complexity": rng.uniform(0.2, 0.85)},
-        )
-    return acba.get_performance_summary()
+        perf_quality = rng.uniform(0.6, 0.95)
+        qc = acba.complexity_assessor.assess_complexity(query)
+        if qc.overall_score > 0.6 and alloc.arm_selected in [BudgetArm.HEAVY_RETRIEVE, BudgetArm.ADAPTIVE_COMPRESS]:
+            perf_quality = min(1.0, perf_quality + 0.15)
+        elif qc.overall_score < 0.4 and alloc.arm_selected == BudgetArm.LIGHT_RETRIEVE:
+            perf_quality = min(1.0, perf_quality + 0.1)
+        
+        # Simulate latency and token usage
+        latency_ms = rng.uniform(500, 3000)
+        tokens_used = int(alloc.total_budget * rng.uniform(0.8, 1.1))
+
+        perf_metrics = {"quality": perf_quality, "latency": latency_ms, "tokens_used": tokens_used}
+        await acba.update_with_feedback(alloc, perf_metrics, context={"query_type": qt, "complexity": qc.overall_score})
+        await asyncio.sleep(0.01)
+
+    summary = acba.get_performance_summary()
+    logger.info("=" * 20 + " SIMULATION SUMMARY " + "=" * 20)
+    for k, v in summary.items():
+        logger.info(f"{k}: {v}")
+    return summary
+
 
 if __name__ == "__main__":
     import asyncio

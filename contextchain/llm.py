@@ -219,63 +219,106 @@ class BaseLLMClient(ABC):
         pass
 
 class OllamaLLM(BaseLLMClient):
-    """Ollama LLM client"""
+    """Ollama LLM client with streaming support and enhanced handling"""
+    
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         if not HTTPX_AVAILABLE:
             raise ImportError("httpx library not installed. Run: pip install httpx")
         self.client = httpx.AsyncClient(
             base_url=config.api_base or "http://localhost:11434",
-            timeout=config.timeout
+            timeout=120
         )
-
+    
     async def generate(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> GenerationResult:
         payload = {
             "model": self.config.model_name,
             "prompt": prompt,
-            "stream": False,
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature
-            }
+            },
+            "stream": False
         }
-        response = await self.client.post("/api/generate", json=payload)
-        response.raise_for_status()
-        result_data = response.json()
-        return GenerationResult(
-            content=result_data.get('response', '').strip(),
-            tokens_used=result_data.get('eval_count', 0) + result_data.get('prompt_eval_count', 0),
-            input_tokens=result_data.get('prompt_eval_count', 0),
-            output_tokens=result_data.get('eval_count', 0)
-        )
+        try:
+            response = await self.client.post("/api/generate", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data.get("response"), list):
+                content = "".join(chunk.get("response", "") for chunk in data["response"]).strip()
+            else:
+                content = str(data.get("response", "")).strip()
+            return GenerationResult(
+                content=content,
+                tokens_used=data.get("eval_count", 0) + data.get("prompt_eval_count", 0),
+                input_tokens=data.get("prompt_eval_count", 0),
+                output_tokens=data.get("eval_count", 0),
+                finish_reason=data.get("finish_reason")
+            )
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Ollama generation failed: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Ollama generation error: {str(e)}")
+            raise
 
     async def generate_stream(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> AsyncGenerator[str, None]:
-        result = await self.generate(prompt, max_tokens, temperature, **kwargs)
-        yield result.content
+        payload = {
+            "model": self.config.model_name,
+            "prompt": prompt,
+            "options": {
+                "num_predict": max_tokens,
+                "temperature": temperature
+            },
+            "stream": True
+        }
+        try:
+            async with self.client.stream("POST", "/api/generate", json=payload) as response:
+                response.raise_for_status()
+                content_accum = ""
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        chunk = data.get("response", "")
+                        content_accum += chunk
+                        yield chunk
+                        if data.get("done", False):
+                            logger.debug("Ollama streaming done.")
+                            break
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode line as JSON: {line}")
+                        continue
+        except Exception as e:
+            logger.error(f"Ollama streaming generation failed: {str(e)}")
+            yield ""
 
     async def health_check(self) -> Dict[str, Any]:
         try:
             start_time = time.time()
-            response = await self.client.get("/api/tags")
-            status = "healthy" if response.status_code == 200 else "unhealthy"
+            resp = await self.client.get("/api/tags")
+            status = "healthy" if resp.status_code == 200 else "unhealthy"
             latency = time.time() - start_time
             return {
-                'status': status,
-                'model': self.config.model_name,
-                'latency_seconds': latency,
-                'timestamp': datetime.utcnow()
+                "status": status,
+                "model": self.config.model_name,
+                "latency": latency,
+                "timestamp": datetime.utcnow()
             }
         except Exception as e:
-            logger.error(f"Health check failed: {str(e)}")
+            logger.error(f"Ollama health check failed: {str(e)}")
             return {
-                'status': 'unhealthy',
-                'model': self.config.model_name,
-                'error': str(e),
-                'timestamp': datetime.utcnow()
+                "status": "unhealthy",
+                "model": self.config.model_name,
+                "error": str(e),
+                "timestamp": datetime.utcnow()
             }
 
-    async def close(self):
+    async def close(self) -> None:
         await self.client.aclose()
+
 
 class HuggingFaceLLM(BaseLLMClient):
     """HuggingFace LLM client"""

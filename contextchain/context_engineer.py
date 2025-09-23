@@ -3,9 +3,11 @@ Context Engineer v2.0
 Advanced prompt construction with embedding-informed optimization
 Integrates: Huang et al. (2025) embedding-informed retrieval patterns
 """
+from __future__ import annotations
 
 import re
 import json
+import asyncio
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -18,13 +20,14 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
 from .acba import BudgetAllocation, QueryComplexity
+from .dag import ExecutionContext  # Import for type hinting
 
 logger = logging.getLogger(__name__)
 
 class PromptStyle(Enum):
     """Available prompt construction styles"""
     QA_STRUCTURED = "qa_structured"
-    REASONING_FRIENDLY = "reasoning_friendly"  
+    REASONING_FRIENDLY = "reasoning_friendly"
     CHAIN_OF_THOUGHT = "chain_of_thought"
     FEW_SHOT = "few_shot"
     COMPLIANCE = "compliance"
@@ -73,6 +76,7 @@ class PromptConstructionConfig:
     compliance_mode: bool = False
     few_shot_examples: int = 3
     cot_enabled: bool = True
+    quality_threshold: float = 0.3
 
 class EmbeddingInformedOptimizer:
     """
@@ -94,8 +98,6 @@ class EmbeddingInformedOptimizer:
             return self.quality_cache[cache_key]
         
         # Quality factors based on Huang et al. embedding-informed approach
-        
-        # 1. Semantic relevance (embedding similarity proxy using TF-IDF)
         try:
             docs_and_query = [doc.content, query]
             tfidf_matrix = self.vectorizer.fit_transform(docs_and_query)
@@ -104,62 +106,54 @@ class EmbeddingInformedOptimizer:
         except:
             semantic_score = 0.5  # Fallback
         
-        # 2. Information density
+        # Information density
         words = doc.content.split()
         unique_words = set(words)
         density_score = len(unique_words) / len(words) if words else 0.0
         
-        # 3. Completeness (sentence structure integrity)
+        # Completeness (sentence structure integrity)
         sentences = [s.strip() for s in doc.content.split('.') if s.strip()]
         complete_sentences = len([s for s in sentences if len(s.split()) >= 3])
         completeness_score = complete_sentences / len(sentences) if sentences else 0.0
         
-        # 4. Authority and freshness
+        # Authority and freshness
         authority_score = doc.metadata.authority_score
         temporal_score = doc.metadata.temporal_relevance
         
-        # 5. Compression quality (if compressed)
+        # Compression quality
         compression_quality = 1.0 - doc.metadata.compression_loss
         
-        # Weighted combination following embedding-informed principles
+        # Weighted combination
         quality_score = (
-            0.35 * semantic_score +           # Semantic relevance (highest weight)
-            0.20 * density_score +            # Information density
-            0.15 * completeness_score +       # Structural completeness
-            0.15 * authority_score +          # Source authority
-            0.10 * temporal_score +           # Temporal relevance
-            0.05 * compression_quality        # Compression preservation
+            0.35 * semantic_score +
+            0.20 * density_score +
+            0.15 * completeness_score +
+            0.15 * authority_score +
+            0.10 * temporal_score +
+            0.05 * compression_quality
         )
         
         self.quality_cache[cache_key] = quality_score
         return quality_score
     
-    def filter_documents_by_quality(self, 
-                                   docs: List[ProcessedDocument], 
-                                   query: str) -> List[ProcessedDocument]:
+    def filter_documents_by_quality(self, docs: List[ProcessedDocument], query: str) -> List[ProcessedDocument]:
         """Filter documents by embedding-informed quality assessment"""
-        
         quality_scores = []
         for doc in docs:
             quality = self.assess_document_quality(doc, query)
             quality_scores.append((doc, quality))
         
-        # Filter by threshold and sort by quality
         filtered_docs = [
             (doc, score) for doc, score in quality_scores 
             if score >= self.quality_threshold
         ]
         
         if not filtered_docs:
-            # If no docs meet threshold, take top 3 anyway
-            logger.warning(f"No documents met quality threshold {self.quality_threshold}, "
-                         f"using top documents")
+            logger.warning(f"No documents met quality threshold {self.quality_threshold}, using top documents")
             filtered_docs = sorted(quality_scores, key=lambda x: x[1], reverse=True)[:3]
         
-        # Sort by quality score descending
         filtered_docs.sort(key=lambda x: x[1], reverse=True)
         
-        # Update processing info with quality scores
         result_docs = []
         for doc, score in filtered_docs:
             doc.processing_info['quality_score'] = score
@@ -176,13 +170,8 @@ class DocumentProcessor:
         self.config = config
         self.embedding_optimizer = EmbeddingInformedOptimizer()
         
-    def process_documents(self, 
-                         raw_docs: List[Dict], 
-                         query: str,
-                         budget: BudgetAllocation) -> List[ProcessedDocument]:
+    def process_documents(self, raw_docs: List[Dict], query: str, budget: BudgetAllocation) -> List[ProcessedDocument]:
         """Process raw documents into optimized format"""
-        
-        # Convert raw docs to ProcessedDocument format
         processed_docs = []
         for i, raw_doc in enumerate(raw_docs):
             metadata = self._extract_metadata(raw_doc, i)
@@ -195,15 +184,8 @@ class DocumentProcessor:
             )
             processed_docs.append(proc_doc)
         
-        # Apply embedding-informed quality filtering
-        quality_filtered = self.embedding_optimizer.filter_documents_by_quality(
-            processed_docs, query
-        )
-        
-        # Order documents according to strategy
+        quality_filtered = self.embedding_optimizer.filter_documents_by_quality(processed_docs, query)
         ordered_docs = self._order_documents(quality_filtered, query)
-        
-        # Truncate to budget
         budget_constrained = self._apply_budget_constraints(ordered_docs, budget)
         
         return budget_constrained
@@ -225,61 +207,47 @@ class DocumentProcessor:
     
     def _order_documents(self, docs: List[ProcessedDocument], query: str) -> List[ProcessedDocument]:
         """Order documents according to configured strategy"""
-        
         if self.config.order_strategy == DocumentOrder.RELEVANCE_SCORE:
             return sorted(docs, key=lambda d: d.metadata.retrieval_score, reverse=True)
-        
         elif self.config.order_strategy == DocumentOrder.COMPRESSION_RETENTION:
             return sorted(docs, key=lambda d: 1.0 - d.metadata.compression_loss, reverse=True)
-        
         elif self.config.order_strategy == DocumentOrder.TEMPORAL:
             return sorted(docs, key=lambda d: d.metadata.temporal_relevance, reverse=True)
-        
         elif self.config.order_strategy == DocumentOrder.AUTHORITY:
             return sorted(docs, key=lambda d: d.metadata.authority_score, reverse=True)
-        
         elif self.config.order_strategy == DocumentOrder.HYBRID_WEIGHTED:
             return self._hybrid_weighted_ordering(docs, query)
-        
         else:
-            return docs  # No reordering
+            return docs
     
     def _hybrid_weighted_ordering(self, docs: List[ProcessedDocument], query: str) -> List[ProcessedDocument]:
         """Hybrid weighted document ordering"""
-        
         def compute_hybrid_score(doc: ProcessedDocument) -> float:
-            # Weighted combination of multiple factors
             relevance = doc.metadata.retrieval_score
             quality = doc.processing_info.get('quality_score', 0.5)
             authority = doc.metadata.authority_score
             compression_quality = 1.0 - doc.metadata.compression_loss
             temporal = doc.metadata.temporal_relevance
             
-            # Adaptive weights based on query characteristics
             query_lower = query.lower()
-            
             if any(word in query_lower for word in ['recent', 'latest', 'current', 'now']):
-                # Temporal queries: prioritize recency
                 weights = [0.25, 0.20, 0.15, 0.10, 0.30]
             elif any(word in query_lower for word in ['analysis', 'analyze', 'study', 'research']):
-                # Analytical queries: prioritize quality and authority
                 weights = [0.25, 0.30, 0.25, 0.15, 0.05]
             else:
-                # General queries: balanced approach
                 weights = [0.30, 0.25, 0.20, 0.15, 0.10]
             
-            score = (weights[0] * relevance + 
-                    weights[1] * quality + 
-                    weights[2] * authority + 
-                    weights[3] * compression_quality + 
-                    weights[4] * temporal)
-            
-            return score
+            return (
+                weights[0] * relevance +
+                weights[1] * quality +
+                weights[2] * authority +
+                weights[3] * compression_quality +
+                weights[4] * temporal
+            )
         
         scored_docs = [(doc, compute_hybrid_score(doc)) for doc in docs]
         scored_docs.sort(key=lambda x: x[1], reverse=True)
         
-        # Update processing info with hybrid scores
         result_docs = []
         for doc, score in scored_docs:
             doc.processing_info['hybrid_score'] = score
@@ -287,25 +255,20 @@ class DocumentProcessor:
         
         return result_docs
     
-    def _apply_budget_constraints(self, 
-                                 docs: List[ProcessedDocument], 
-                                 budget: BudgetAllocation) -> List[ProcessedDocument]:
+    def _apply_budget_constraints(self, docs: List[ProcessedDocument], budget: BudgetAllocation) -> List[ProcessedDocument]:
         """Apply token budget constraints to document selection"""
-        
         available_tokens = budget.retrieval_tokens
         selected_docs = []
         used_tokens = 0
         
         for doc in docs:
             doc_tokens = doc.metadata.token_count
-            
             if used_tokens + doc_tokens <= available_tokens:
                 selected_docs.append(doc)
                 used_tokens += doc_tokens
             else:
-                # Try to truncate document to fit remaining budget
                 remaining_tokens = available_tokens - used_tokens
-                if remaining_tokens > 50:  # Minimum viable truncation
+                if remaining_tokens > 50:
                     truncated_content = self._truncate_document(doc.content, remaining_tokens)
                     if truncated_content:
                         truncated_doc = ProcessedDocument(
@@ -322,34 +285,28 @@ class DocumentProcessor:
                         used_tokens += remaining_tokens
                 break
         
-        logger.info(f"Budget constraint: {len(docs)} -> {len(selected_docs)} docs, "
-                   f"{used_tokens}/{available_tokens} tokens used")
-        
+        logger.info(f"Budget constraint: {len(docs)} -> {len(selected_docs)} docs, {used_tokens}/{available_tokens} tokens used")
         return selected_docs
     
     def _truncate_document(self, content: str, max_tokens: int) -> str:
         """Intelligently truncate document to fit token budget"""
-        
-        # Simple word-based truncation (can be enhanced with sentence-aware truncation)
         words = content.split()
         if len(words) <= max_tokens:
             return content
         
-        # Try to truncate at sentence boundaries
         sentences = content.split('.')
         truncated = ""
         word_count = 0
         
         for sentence in sentences:
             sentence_words = sentence.strip().split()
-            if word_count + len(sentence_words) <= max_tokens - 1:  # -1 for period
+            if word_count + len(sentence_words) <= max_tokens - 1:
                 truncated += sentence.strip() + ". "
                 word_count += len(sentence_words)
             else:
                 break
         
         if not truncated.strip():
-            # Fallback: simple word truncation
             truncated = " ".join(words[:max_tokens])
         
         return truncated.strip()
@@ -359,15 +316,22 @@ class PromptTemplateManager:
     
     def __init__(self, templates_dir: Optional[str] = None):
         self.templates_dir = Path(templates_dir) if templates_dir else Path("contextchain/prompts")
+        # Verify templates directory exists
+        if not self.templates_dir.exists():
+            logger.warning(f"Templates directory {self.templates_dir} does not exist, falling back to default templates")
+            self.templates_dir.mkdir(parents=True, exist_ok=True)
+        
         self.env = jinja2.Environment(
             loader=jinja2.FileSystemLoader(str(self.templates_dir)),
             autoescape=jinja2.select_autoescape(['html', 'xml'])
         )
         self.custom_filters()
         
+        # Verify required template files
+        self._verify_templates()
+
     def custom_filters(self):
         """Add custom Jinja2 filters"""
-        
         def truncate_words(text, max_words=100):
             words = str(text).split()
             if len(words) <= max_words:
@@ -377,18 +341,36 @@ class PromptTemplateManager:
         def citation_format(source_id):
             return f"[{source_id}]"
         
-        def metadata_summary(metadata_dict):
-            if not metadata_dict:
-                return ""
-            return f"(score: {metadata_dict.get('retrieval_score', 0):.2f})"
+        def metadata_summary(metadata: DocumentMetadata):
+            """Generate summary for DocumentMetadata object"""
+            return f"(score: {metadata.retrieval_score:.2f})"
         
         self.env.filters['truncate_words'] = truncate_words
         self.env.filters['cite'] = citation_format
         self.env.filters['meta'] = metadata_summary
     
+    def _verify_templates(self):
+        """Verify that required .j2 template files exist"""
+        template_map = {
+            PromptStyle.QA_STRUCTURED: "qa_structured.j2",
+            PromptStyle.REASONING_FRIENDLY: "reasoning_friendly.j2",
+            PromptStyle.CHAIN_OF_THOUGHT: "chain_of_thought.j2",
+            PromptStyle.FEW_SHOT: "few_shot.j2",
+            PromptStyle.COMPLIANCE: "compliance.j2",
+            PromptStyle.ANALYTICAL: "analytical.j2",
+            PromptStyle.COMPARATIVE: "comparative.j2"
+        }
+        missing_templates = []
+        for style, template_file in template_map.items():
+            template_path = self.templates_dir / template_file
+            if not template_path.exists():
+                logger.warning(f"Template file {template_file} not found in {self.templates_dir}")
+                missing_templates.append(template_file)
+        if missing_templates:
+            logger.info(f"Missing templates: {', '.join(missing_templates)}. Will use default templates for these styles.")
+
     def load_template(self, style: PromptStyle) -> jinja2.Template:
         """Load template for given style"""
-        
         template_map = {
             PromptStyle.QA_STRUCTURED: "qa_structured.j2",
             PromptStyle.REASONING_FRIENDLY: "reasoning_friendly.j2",
@@ -409,7 +391,6 @@ class PromptTemplateManager:
     
     def _get_default_template(self, style: PromptStyle) -> str:
         """Get default template if file not found"""
-        
         templates = {
             PromptStyle.QA_STRUCTURED: """System: You are an expert assistant. Use only the information provided in the context to answer questions accurately and comprehensively.
 
@@ -521,25 +502,21 @@ class SafetyFilter:
     
     def filter_content(self, content: str) -> Tuple[str, List[str]]:
         """Filter content for PII and safety issues"""
-        
         filtered_content = content
         issues_found = []
         
         if self.config.safety_filtering:
-            # PII redaction
             for pii_type, pattern in self.pii_patterns.items():
                 matches = pattern.findall(filtered_content)
                 if matches:
                     issues_found.append(f"pii_{pii_type}")
                     filtered_content = pattern.sub(f'[{pii_type.upper()}_REDACTED]', filtered_content)
             
-            # Safety keyword detection
             content_lower = filtered_content.lower()
             for keyword in self.safety_keywords:
                 if keyword in content_lower:
                     issues_found.append(f"safety_keyword_{keyword.replace(' ', '_')}")
                     if self.config.compliance_mode:
-                        # In compliance mode, redact the entire sentence containing the keyword
                         sentences = filtered_content.split('.')
                         filtered_sentences = []
                         for sentence in sentences:
@@ -557,40 +534,41 @@ class ContextEngineer:
     Integrates all components for advanced prompt construction
     """
     
-    def __init__(self, config: Optional[PromptConstructionConfig] = None):
+    def __init__(self, config: Optional[PromptConstructionConfig] = None, templates_dir: Optional[str] = None):
         self.config = config or PromptConstructionConfig()
+        self.templates_dir = templates_dir or "/Users/mohammednihal/Desktop/ContextChain/ContextChain/contextchain/prompts"
         self.doc_processor = DocumentProcessor(self.config)
-        self.template_manager = PromptTemplateManager()
+        self.template_manager = PromptTemplateManager(self.templates_dir)
         self.safety_filter = SafetyFilter(self.config)
         
-        # Token estimation (simplified - can be enhanced with actual tokenizer)
+        # Token estimation (simplified)
         self.avg_chars_per_token = 4
         
-        logger.info(f"ContextEngineer initialized with style: {self.config.style.value}")
+        logger.info(f"ContextEngineer initialized with style: {self.config.style.value}, templates_dir: {self.templates_dir}")
     
-    def build_prompt(self, 
-                    query: str,
-                    raw_docs: List[Dict],
-                    budget: BudgetAllocation,
-                    complexity: Optional[QueryComplexity] = None) -> str:
+    async def build_prompt(self, 
+                          query: str,
+                          raw_docs: List[Dict],
+                          budget: BudgetAllocation,
+                          semantic_state: Dict[str, Any] = None,
+                          complexity: Optional[QueryComplexity] = None) -> str:
         """
-        Main method: Build optimized prompt from query and documents
+        Main async method: Build optimized prompt from query and documents
         """
-        
         start_time = datetime.utcnow()
-        
         try:
-            # Step 1: Process and optimize documents
-            processed_docs = self.doc_processor.process_documents(raw_docs, query, budget)
+            # Process documents asynchronously
+            processed_docs = await asyncio.to_thread(
+                self.doc_processor.process_documents,
+                raw_docs, query, budget
+            )
             
-            # Step 2: Apply safety filtering
+            # Apply safety filtering
             filtered_docs = []
             total_safety_issues = []
-            
             for doc in processed_docs:
-                filtered_content, issues = self.safety_filter.filter_content(doc.content)
+                filtered_content, issues = await asyncio.to_thread(self.safety_filter.filter_content, doc.content)
                 total_safety_issues.extend(issues)
-                
                 filtered_doc = ProcessedDocument(
                     content=filtered_content,
                     metadata=doc.metadata,
@@ -602,24 +580,18 @@ class ContextEngineer:
                 )
                 filtered_docs.append(filtered_doc)
             
-            # Step 3: Load and render template
-            template = self.template_manager.load_template(self.config.style)
+            # Load and render template
+            template = await asyncio.to_thread(self.template_manager.load_template, self.config.style)
+            template_context = self._prepare_template_context(query, filtered_docs, budget, complexity)
+            rendered_prompt = await asyncio.to_thread(template.render, **template_context)
             
-            # Step 4: Prepare template context
-            template_context = self._prepare_template_context(
-                query, filtered_docs, budget, complexity
-            )
-            
-            # Step 5: Render prompt
-            rendered_prompt = template.render(**template_context)
-            
-            # Step 6: Final token budget validation
+            # Token budget validation
             estimated_tokens = self._estimate_tokens(rendered_prompt)
             if estimated_tokens > self.config.max_prompt_tokens:
                 logger.warning(f"Prompt exceeds token limit: {estimated_tokens} > {self.config.max_prompt_tokens}")
                 rendered_prompt = self._truncate_prompt(rendered_prompt, self.config.max_prompt_tokens)
             
-            # Step 7: Add metadata footer if enabled
+            # Add metadata footer
             if self.config.include_metadata:
                 metadata_footer = self._generate_metadata_footer(
                     processed_docs, total_safety_issues, estimated_tokens, start_time
@@ -633,40 +605,33 @@ class ContextEngineer:
             
         except Exception as e:
             logger.error(f"Error building prompt: {str(e)}")
-            # Fallback to simple prompt construction
             return self._build_fallback_prompt(query, raw_docs)
     
-    def _prepare_template_context(self, 
-                                query: str,
-                                docs: List[ProcessedDocument],
-                                budget: BudgetAllocation,
-                                complexity: Optional[QueryComplexity]) -> Dict[str, Any]:
+    async def close(self):
+        """Close resources and clear caches asynchronously"""
+        try:
+            self.doc_processor.embedding_optimizer.quality_cache.clear()
+            logger.info("ContextEngineer caches cleared successfully")
+        except Exception as e:
+            logger.error(f"Error closing ContextEngineer: {str(e)}")
+    
+    def _prepare_template_context(self, query: str, docs: List[ProcessedDocument], budget: BudgetAllocation, complexity: Optional[QueryComplexity]) -> Dict[str, Any]:
         """Prepare context variables for template rendering"""
-        
         context = {
             'query': query,
             'documents': docs,
             'doc_count': len(docs),
-            'budget': budget,
+            'budget': asdict(budget),  # Convert BudgetAllocation dataclass to dict
             'style': self.config.style.value,
             'timestamp': datetime.utcnow().isoformat(),
         }
         
-        # Add complexity information if available
         if complexity:
-            context['complexity'] = {
-                'overall': complexity.overall_score,
-                'semantic': complexity.semantic_complexity,
-                'compositional': complexity.compositional_complexity,
-                'temporal': complexity.temporal_complexity,
-                'domain': complexity.domain_complexity
-            }
+            context['complexity'] = asdict(complexity)  # Convert QueryComplexity dataclass to dict
         
-        # Add few-shot examples if enabled
         if self.config.style == PromptStyle.FEW_SHOT:
             context['examples'] = self._get_few_shot_examples(query, self.config.few_shot_examples)
         
-        # Add compliance information if enabled
         if self.config.compliance_mode:
             context['compliance'] = {
                 'enabled': True,
@@ -678,10 +643,6 @@ class ContextEngineer:
     
     def _get_few_shot_examples(self, query: str, num_examples: int) -> List[Dict[str, str]]:
         """Get few-shot examples relevant to query (simplified implementation)"""
-        
-        # In production, this would use a database of high-quality examples
-        # For now, providing basic examples based on query type
-        
         query_lower = query.lower()
         
         if 'analyze' in query_lower or 'analysis' in query_lower:
@@ -723,11 +684,9 @@ class ContextEngineer:
     def _truncate_prompt(self, prompt: str, max_tokens: int) -> str:
         """Truncate prompt to fit token budget"""
         max_chars = max_tokens * self.avg_chars_per_token
-        
         if len(prompt) <= max_chars:
             return prompt
         
-        # Try to truncate at paragraph boundaries
         paragraphs = prompt.split('\n\n')
         truncated = ""
         
@@ -738,18 +697,12 @@ class ContextEngineer:
                 break
         
         if not truncated.strip():
-            # Fallback: character truncation
             truncated = prompt[:max_chars]
         
         return truncated.strip() + "\n\n[PROMPT_TRUNCATED_TO_FIT_BUDGET]"
     
-    def _generate_metadata_footer(self, 
-                                 docs: List[ProcessedDocument],
-                                 safety_issues: List[str],
-                                 estimated_tokens: int,
-                                 start_time: datetime) -> str:
+    def _generate_metadata_footer(self, docs: List[ProcessedDocument], safety_issues: List[str], estimated_tokens: int, start_time: datetime) -> str:
         """Generate metadata footer for transparency"""
-        
         processing_time = (datetime.utcnow() - start_time).total_seconds()
         
         footer_lines = [
@@ -760,7 +713,7 @@ class ContextEngineer:
             f"- Processing time: {processing_time:.3f}s",
             f"- Safety issues detected: {len(safety_issues)}",
             f"- Style: {self.config.style.value}",
-            f"- Quality threshold applied: {self.embedding_optimizer.quality_threshold}"
+            f"- Quality threshold applied: {self.doc_processor.embedding_optimizer.quality_threshold}"
         ]
         
         if safety_issues:
@@ -773,14 +726,12 @@ class ContextEngineer:
     
     def _build_fallback_prompt(self, query: str, raw_docs: List[Dict]) -> str:
         """Build simple fallback prompt when main process fails"""
-        
         context_parts = []
-        for i, doc in enumerate(raw_docs[:3]):  # Limit to 3 docs for safety
-            content = doc.get('content', str(doc))[:500]  # Limit length
+        for i, doc in enumerate(raw_docs[:3]):
+            content = doc.get('content', str(doc))[:500]
             context_parts.append(f"Document {i+1}: {content}")
         
         context = "\n\n".join(context_parts)
-        
         return f"""Context:
 {context}
 
@@ -788,12 +739,8 @@ Query: {query}
 
 Please answer based on the provided context."""
 
-# Example usage and testing
-
 def test_context_engineer():
     """Test the ContextEngineer functionality"""
-    
-    # Configuration
     config = PromptConstructionConfig(
         style=PromptStyle.ANALYTICAL,
         max_prompt_tokens=1500,
@@ -802,12 +749,9 @@ def test_context_engineer():
         safety_filtering=True
     )
     
-    # Initialize engineer
-    engineer = ContextEngineer(config)
+    engineer = ContextEngineer(config, templates_dir="/Users/mohammednihal/Desktop/ContextChain/ContextChain/contextchain/prompts")
     
-    # Test data
     query = "Analyze the Q3 2025 sales performance and identify key growth drivers"
-    
     raw_docs = [
         {
             'content': 'Q3 2025 sales reached $2.8M, representing a 22% increase from Q2 2025 ($2.3M). The primary growth drivers were the launch of our premium product line, expansion into the European market, and improved customer retention rates.',
@@ -832,7 +776,6 @@ def test_context_engineer():
         }
     ]
     
-    # Mock budget allocation
     from .acba import BudgetAllocation, BudgetArm
     
     budget = BudgetAllocation(
@@ -847,14 +790,15 @@ def test_context_engineer():
         allocation_timestamp=datetime.utcnow()
     )
     
-    # Build prompt
-    prompt = engineer.build_prompt(query, raw_docs, budget)
+    # Run async test
+    prompt = asyncio.run(engineer.build_prompt(query, raw_docs, budget))
     
     print("Generated Prompt:")
     print("=" * 80)
     print(prompt)
     print("=" * 80)
     
+    asyncio.run(engineer.close())
     return prompt
 
 if __name__ == "__main__":

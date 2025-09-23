@@ -1,4 +1,3 @@
-# contextchain/src/dag.py
 """
 Dynamic Async DAG Engine for ContextChain v2.0
 Implements: DynTaskMAS dynamic task graphs, semantic context sharing
@@ -7,18 +6,17 @@ Implements: DynTaskMAS dynamic task graphs, semantic context sharing
 import asyncio
 import logging
 from typing import Dict, List, Callable, Any, Optional, Union, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from enum import Enum
 import inspect
 import json
+from .acba import BudgetAllocation, BudgetArm, QueryComplexity
 from concurrent.futures import ThreadPoolExecutor
 import networkx as nx
 from abc import ABC, abstractmethod
 from .vector import HybridVectorStore
 from .llm import BaseLLMClient
-from .context_engineer import ContextEngineer
-from .acba import BudgetAllocation, BudgetArm
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +213,7 @@ class DynamicTaskGraph:
             },
             'complex_analytical': {
                 'description': 'Complex analytical query requiring multi-step processing',
-                'tasks': ['fetch_data', 'budget_allocation', 'parallel_retrieve', 'compress_context', 'analyze_data', 'generate_insights'],
+                'tasks': ['fetch_data', 'budget_allocation', 'retrieve_docs', 'retrieve_metadata', 'assess_quality', 'compress_context', 'analyze_data', 'generate_insights'],
                 'parallel_groups': [['retrieve_docs', 'retrieve_metadata', 'assess_quality']],
                 'conditional_tasks': {
                     'compress_context': 'budget_allocation.compression_needed',
@@ -311,34 +309,55 @@ class DynamicTaskGraph:
     
     async def _generate_adaptive_tasks(self, base_template: Dict, query_analysis: Dict[str, Any], context: ExecutionContext) -> List[Task]:
         tasks = []
-        complexity = query_analysis['estimated_processing_complexity']
+        task_id_counter = 0
+        task_id_map = {}  # Maps task_name to task_id
         
+        # Process sequential tasks
         for task_name in base_template['tasks']:
-            task_config = self._get_adaptive_task_config(task_name, query_analysis, complexity)
-            task = self._create_task_instance(task_name, task_config, context)
+            task_id_counter += 1
+            task_id = f"{task_name}_{task_id_counter}"
+            task_id_map[task_name] = task_id
+            task_config = self._get_adaptive_task_config(task_name, query_analysis, context)
+            task = self._create_task_instance(task_name, task_config, context, task_id)
             if task:
+                # Add dependencies for tasks following parallel groups
+                if 'parallel_groups' in base_template:
+                    parallel_tasks = [t for group in base_template['parallel_groups'] for t in group]
+                    if task_name not in parallel_tasks:
+                        task_index = base_template['tasks'].index(task_name)
+                        for group in base_template['parallel_groups']:
+                            if group and base_template['tasks'].index(group[0]) < task_index:
+                                task.metadata.dependencies.update(
+                                    {task_id_map[t] for t in group if t in task_id_map}
+                                )
                 tasks.append(task)
+                logger.debug(f"Added task {task_id} with dependencies {task.metadata.dependencies}")
         
+        # Process conditional tasks
         for task_name, condition in base_template.get('conditional_tasks', {}).items():
             if self._evaluate_task_condition(condition, query_analysis, context):
-                task_config = self._get_adaptive_task_config(task_name, query_analysis, complexity)
-                task = self._create_task_instance(task_name, task_config, context)
+                task_id_counter += 1
+                task_id = f"{task_name}_{task_id_counter}"
+                task_id_map[task_name] = task_id
+                task_config = self._get_adaptive_task_config(task_name, query_analysis, context)
+                task = self._create_task_instance(task_name, task_config, context, task_id)
                 if task:
                     tasks.append(task)
+                    logger.debug(f"Added conditional task {task_id} with dependencies {task.metadata.dependencies}")
         
         return tasks
     
-    def _get_adaptive_task_config(self, task_name: str, query_analysis: Dict, complexity: float) -> Dict:
+    def _get_adaptive_task_config(self, task_name: str, query_analysis: Dict, context: ExecutionContext) -> Dict:
         base_config = {
             'timeout_seconds': 30.0,
             'max_retries': 2,
             'priority': TaskPriority.MEDIUM
         }
-        if complexity > 2.0:
+        if query_analysis['estimated_processing_complexity'] > 2.0:
             base_config['timeout_seconds'] = 60.0
             base_config['max_retries'] = 3
             base_config['priority'] = TaskPriority.HIGH
-        elif complexity < 1.2:
+        elif query_analysis['estimated_processing_complexity'] < 1.2:
             base_config['timeout_seconds'] = 15.0
             base_config['max_retries'] = 1
         task_adaptations = {
@@ -349,6 +368,18 @@ class DynamicTaskGraph:
             'retrieve_context': {
                 'timeout_seconds': base_config['timeout_seconds'] * 1.5,
                 'description': 'Retrieve and filter contextual documents'
+            },
+            'retrieve_docs': {
+                'timeout_seconds': base_config['timeout_seconds'] * 1.2,
+                'description': 'Retrieve document content for analysis'
+            },
+            'retrieve_metadata': {
+                'timeout_seconds': base_config['timeout_seconds'] * 1.0,
+                'description': 'Retrieve metadata for documents'
+            },
+            'assess_quality': {
+                'timeout_seconds': base_config['timeout_seconds'] * 1.3,
+                'description': 'Assess quality of retrieved documents'
             },
             'compress_context': {
                 'timeout_seconds': base_config['timeout_seconds'] * 2.0,
@@ -364,9 +395,9 @@ class DynamicTaskGraph:
             base_config.update(task_adaptations[task_name])
         return base_config
     
-    def _create_task_instance(self, task_name: str, config: Dict, context: ExecutionContext) -> Optional[Task]:
+    def _create_task_instance(self, task_name: str, config: Dict, context: ExecutionContext, task_id: str) -> Optional[Task]:
         metadata = TaskMetadata(
-            task_id=f"{task_name}_{datetime.utcnow().timestamp()}",
+            task_id=task_id,
             name=task_name,
             description=config.get('description', f'Execute {task_name}'),
             priority=config.get('priority', TaskPriority.MEDIUM),
@@ -377,6 +408,9 @@ class DynamicTaskGraph:
             'fetch_data': FetchDataTask,
             'budget_allocation': BudgetAllocationTask,
             'retrieve_context': lambda metadata: RetrieveContextTask(metadata, self.vector_store),
+            'retrieve_docs': lambda metadata: RetrieveDocsTask(metadata, self.vector_store),
+            'retrieve_metadata': lambda metadata: RetrieveMetadataTask(metadata, self.vector_store),
+            'assess_quality': AssessQualityTask,
             'compress_context': CompressContextTask,
             'generate_response': lambda metadata: GenerateResponseTask(metadata, self.llm_optimizer, self.context_engineer),
             'analyze_data': AnalyzeDataTask,
@@ -387,6 +421,7 @@ class DynamicTaskGraph:
         }
         task_class = task_classes.get(task_name)
         if task_class:
+            logger.debug(f"Creating task instance for {task_name} with ID {task_id}")
             return task_class(metadata)
         else:
             logger.warning(f"Unknown task type: {task_name}")
@@ -431,6 +466,8 @@ class AsyncTaskExecutor:
             if not ready_tasks:
                 remaining_tasks = [t for t in tasks if t.metadata.task_id not in completed_tasks]
                 logger.error(f"No ready tasks found. Remaining: {[t.metadata.task_id for t in remaining_tasks]}")
+                logger.debug(f"Completed tasks: {completed_tasks}")
+                logger.debug(f"All task dependencies: {[(t.metadata.task_id, t.metadata.dependencies) for t in tasks]}")
                 break
             
             parallel_tasks = []
@@ -490,6 +527,8 @@ class AsyncTaskExecutor:
             for dependency in task.metadata.dependencies:
                 if dependency in [t.metadata.task_id for t in tasks]:
                     graph.add_edge(dependency, task.metadata.task_id)
+                else:
+                    logger.warning(f"Unresolved dependency {dependency} for task {task.metadata.task_id}")
         return graph
     
     def get_execution_stats(self) -> Dict[str, Any]:
@@ -504,7 +543,7 @@ class AsyncTaskExecutor:
 class FetchDataTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
         logger.info(f"Fetching data for query: {context.query}")
-        await asyncio.sleep(0.1)  # Simulate I/O delay
+        await asyncio.sleep(0.1)
         fetched_data = {
             'documents': [
                 {'content': f'Mock document 1 for: {context.query}', 'score': 0.9},
@@ -587,17 +626,103 @@ class RetrieveContextTask(Task):
                 error=e
             )
 
+class RetrieveDocsTask(Task):
+    def __init__(self, metadata: TaskMetadata, vector_store: HybridVectorStore):
+        super().__init__(metadata)
+        self.vector_store = vector_store
+
+    async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Retrieving documents for query: {context.query}")
+        try:
+            search_results = await self.vector_store.search(query=context.query, k=10)
+            documents = [
+                {
+                    'content': result.content,
+                    'source_id': result.source_id,
+                    'score': result.fusion_score
+                } for result in search_results
+            ]
+            result = {
+                'documents': documents,
+                'total_retrieved': len(documents)
+            }
+            return TaskResult(
+                task_id=self.metadata.task_id,
+                status=TaskStatus.COMPLETED,
+                result=result,
+                context_updates={'retrieved_docs': result}
+            )
+        except Exception as e:
+            logger.error(f"Document retrieval failed: {str(e)}")
+            return TaskResult(
+                task_id=self.metadata.task_id,
+                status=TaskStatus.FAILED,
+                error=e
+            )
+
+class RetrieveMetadataTask(Task):
+    def __init__(self, metadata: TaskMetadata, vector_store: HybridVectorStore):
+        super().__init__(metadata)
+        self.vector_store = vector_store
+
+    async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Retrieving metadata for query: {context.query}")
+        try:
+            search_results = await self.vector_store.search(query=context.query, k=10)
+            metadata = [
+                {
+                    'source_id': result.source_id,
+                    'metadata': result.metadata
+                } for result in search_results
+            ]
+            result = {
+                'metadata': metadata,
+                'total_retrieved': len(metadata)
+            }
+            return TaskResult(
+                task_id=self.metadata.task_id,
+                status=TaskStatus.COMPLETED,
+                result=result,
+                context_updates={'retrieved_metadata': result}
+            )
+        except Exception as e:
+            logger.error(f"Metadata retrieval failed: {str(e)}")
+            return TaskResult(
+                task_id=self.metadata.task_id,
+                status=TaskStatus.FAILED,
+                error=e
+            )
+
+class AssessQualityTask(Task):
+    async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Assessing quality for query: {context.query}")
+        await asyncio.sleep(0.2)
+        retrieved_docs = context.processed_data.get('retrieved_docs', {}).get('documents', [])
+        quality_scores = [
+            {'source_id': doc['source_id'], 'quality_score': doc.get('score', 0.8) * 0.9}
+            for doc in retrieved_docs
+        ]
+        result = {
+            'quality_scores': quality_scores,
+            'average_quality': sum(score['quality_score'] for score in quality_scores) / len(quality_scores) if quality_scores else 0.8
+        }
+        return TaskResult(
+            task_id=self.metadata.task_id,
+            status=TaskStatus.COMPLETED,
+            result=result,
+            context_updates={'quality_assessment': result}
+        )
+
 class CompressContextTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
         logger.info(f"Compressing context for query: {context.query}")
-        retrieved_context = context.processed_data.get('retrieved_context', {})
+        retrieved_docs = context.processed_data.get('retrieved_docs', {}).get('documents', [])
         budget_allocation = context.budget_allocation
         await asyncio.sleep(0.4)
-        documents = retrieved_context.get('filtered_documents', [])
-        compressed_content = f"Compressed summary of {len(documents)} documents for query: {context.query}"
+        compressed_content = f"Compressed summary of {len(retrieved_docs)} documents for query: {context.query}"
         compression_result = {
             'compressed_content': compressed_content,
-            'original_token_count': sum(len(doc.get('content', '').split()) for doc in documents),
+            'original_token_count': sum(len(doc.get('content', '').split()) for doc in retrieved_docs),
             'compressed_token_count': len(compressed_content.split()),
             'compression_ratio': 0.3,
             'quality_score': 0.85
@@ -610,7 +735,7 @@ class CompressContextTask(Task):
         )
 
 class GenerateResponseTask(Task):
-    def __init__(self, metadata: TaskMetadata, llm_optimizer: BaseLLMClient, context_engineer: ContextEngineer):
+    def __init__(self, metadata: TaskMetadata, llm_optimizer: BaseLLMClient, context_engineer):
         super().__init__(metadata)
         self.llm_optimizer = llm_optimizer
         self.context_engineer = context_engineer
@@ -618,14 +743,22 @@ class GenerateResponseTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
         logger.info(f"Generating response for query: {context.query}")
         try:
-            retrieved_context = context.processed_data.get('retrieved_context', {})
+            retrieved_docs = context.processed_data.get('retrieved_docs', {}).get('documents', [])
             budget = context.budget_allocation
-            documents = retrieved_context.get('filtered_documents', [])
+            complexity = QueryComplexity(
+                overall_score=0.5,
+                semantic_complexity=0.4,
+                compositional_complexity=0.3,
+                temporal_complexity=0.2,
+                domain_complexity=0.3
+            )
+            logger.debug(f"Query complexity for {context.query}: {asdict(complexity)}")
             prompt = await self.context_engineer.build_prompt(
                 query=context.query,
-                raw_docs=documents,
+                raw_docs=retrieved_docs,
                 budget=budget,
-                semantic_state=context.semantic_state
+                semantic_state=context.semantic_state,
+                complexity=complexity
             )
             llm_response = await self.llm_optimizer.generate_optimized(
                 prompt=prompt,
@@ -658,6 +791,7 @@ class GenerateResponseTask(Task):
 
 class AnalyzeDataTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Analyzing data for query: {context.query}")
         await asyncio.sleep(0.3)
         analysis_result = {'analysis': 'Mock analytical insights', 'confidence': 0.8}
         return TaskResult(
@@ -669,6 +803,7 @@ class AnalyzeDataTask(Task):
 
 class GenerateInsightsTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Generating insights for query: {context.query}")
         await asyncio.sleep(0.4)
         insights = {'insights': 'Generated insights based on analysis', 'actionable_items': 3}
         return TaskResult(
@@ -680,6 +815,7 @@ class GenerateInsightsTask(Task):
 
 class ComputeDifferencesTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Computing differences for query: {context.query}")
         await asyncio.sleep(0.2)
         differences = {'differences': 'Computed differences between datasets', 'variance': 0.15}
         return TaskResult(
@@ -691,6 +827,7 @@ class ComputeDifferencesTask(Task):
 
 class IdentifyTrendsTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Identifying trends for query: {context.query}")
         await asyncio.sleep(0.3)
         trends = {'trends': 'Identified temporal trends', 'trend_strength': 0.7}
         return TaskResult(
@@ -702,6 +839,7 @@ class IdentifyTrendsTask(Task):
 
 class DetectAnomaliesTask(Task):
     async def execute(self, context: ExecutionContext) -> TaskResult:
+        logger.info(f"Detecting anomalies for query: {context.query}")
         await asyncio.sleep(0.25)
         anomalies = {'anomalies': 'Detected anomalies in data', 'anomaly_count': 2}
         return TaskResult(
@@ -712,7 +850,10 @@ class DetectAnomaliesTask(Task):
         )
 
 class DAGEngine:
-    def __init__(self, max_parallel_tasks: int = 10, vector_store=None, llm_optimizer=None, context_engineer=None):
+    def __init__(self, max_parallel_tasks: int = 10, vector_store=None, llm_optimizer=None, context_engineer=None, templates_dir: Optional[str] = None):
+        if context_engineer is None:
+            from .context_engineer import ContextEngineer, PromptConstructionConfig
+            context_engineer = ContextEngineer(templates_dir=templates_dir)
         self.task_graph_generator = DynamicTaskGraph(vector_store, llm_optimizer, context_engineer)
         self.context_manager = SemanticContextManager()
         self.executor = AsyncTaskExecutor(max_parallel_tasks)
@@ -736,6 +877,11 @@ class DAGEngine:
         logger.info(f"Executing workflow: {workflow_name} (type: {workflow_type})")
         
         try:
+            # Validate workflow before execution
+            validation = await self.validate_workflow(workflow_name)
+            if not validation['valid']:
+                raise Exception(f"Workflow validation failed: {validation['error']}")
+            
             tasks = await self.task_graph_generator.generate_dynamic_graph(workflow_type, initial_context)
             if not tasks:
                 raise Exception(f"No tasks generated for workflow: {workflow_name}")
@@ -788,7 +934,8 @@ class DAGEngine:
     async def close(self):
         try:
             self.executor.thread_pool.shutdown(wait=True)
-            logger.info("DAGEngine thread pool shut down")
+            await self.task_graph_generator.context_engineer.close()
+            logger.info("DAGEngine thread pool and context engineer shut down")
         except Exception as e:
             logger.error(f"Error closing DAGEngine: {str(e)}")
     
@@ -836,16 +983,31 @@ async def test_dag_engine():
     from .vector import HybridVectorStore, VectorStoreConfig
     
     llm = create_llm_client(provider="ollama", model="mistral")
-    context_engineer = ContextEngineer(PromptConstructionConfig())
+    context_engineer = ContextEngineer(
+        PromptConstructionConfig(),
+        templates_dir="/Users/mohammednihal/Desktop/ContextChain/ContextChain/contextchain/prompts"
+    )
     vector_store = HybridVectorStore(VectorStoreConfig())
     
-    engine = DAGEngine(max_parallel_tasks=5, vector_store=vector_store, llm_optimizer=llm, context_engineer=context_engineer)
+    engine = DAGEngine(
+        max_parallel_tasks=5,
+        vector_store=vector_store,
+        llm_optimizer=llm,
+        context_engineer=context_engineer,
+        templates_dir="/Users/mohammednihal/Desktop/ContextChain/ContextChain/contextchain/prompts"
+    )
     
     context = ExecutionContext(
         session_id='test_session',
         query='Analyze the Q3 2025 sales performance and identify growth drivers',
         raw_data={'documents': []}
     )
+    
+    # Validate workflow before execution
+    validation = await engine.validate_workflow('historical_analysis')
+    if not validation['valid']:
+        print(f"Workflow validation failed: {validation['error']}")
+        return
     
     result_context = await engine.execute_workflow('historical_analysis', context)
     
