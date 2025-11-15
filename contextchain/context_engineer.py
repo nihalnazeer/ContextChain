@@ -1,26 +1,31 @@
 """
-Context Engineer v2.0
+Context Engineer v2.1
 Advanced prompt construction with embedding-informed optimization
 Integrates: Huang et al. (2025) embedding-informed retrieval patterns
 """
+
 from __future__ import annotations
 
 import re
 import json
 import asyncio
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Tuple, Optional, Any, Union, TYPE_CHECKING  # Fixed: Added TYPE_CHECKING
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from enum import Enum
 import logging
 from pathlib import Path
 import jinja2
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer 
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+import xml.etree.ElementTree as ET  # For XML wrapping
 
 from .acba import BudgetAllocation, QueryComplexity
-from .dag import ExecutionContext  # Import for type hinting
+
+# Fixed: Conditional import for type hinting to break circular import
+if TYPE_CHECKING:
+    from .dag import ExecutionContext  # Now only imported for type-checking, not runtime
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +82,9 @@ class PromptConstructionConfig:
     few_shot_examples: int = 3
     cot_enabled: bool = True
     quality_threshold: float = 0.3
+    numeric_processing: bool = True  # New: Enable automatic numeric detection and narrativization
+    numeric_quality_threshold: float = 0.5  # New: Min proportion of numeric content to trigger processing
+    xml_wrap: bool = True  # New: Toggle XML wrapping for final prompt
 
 class EmbeddingInformedOptimizer:
     """
@@ -163,12 +171,125 @@ class EmbeddingInformedOptimizer:
         logger.info(f"Quality filtering: {len(docs)} -> {len(result_docs)} documents")
         return result_docs
 
+class NumericProcessor:
+    """Handles automatic detection, normalization, and narrativization of numeric data in documents."""
+    
+    def __init__(self, config: PromptConstructionConfig):
+        self.config = config
+        self.numeric_pattern = re.compile(r"\$?\d[\d,.]*[MK]?")  # Matches numbers like "$123,456", "12.34M"
+        self.month_pattern = re.compile(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", re.IGNORECASE)
+        self.date_pattern = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")  # Simple date matcher (YYYY-MM-DD)
+    
+    def process_document(self, doc: ProcessedDocument) -> ProcessedDocument:
+        """Process a single document: Detect, normalize, narrativize if numeric, else return unchanged."""
+        if not self.config.numeric_processing:
+            return doc
+        
+        content = doc.content
+        try:
+            # Step 1: Detect numeric/structured patterns
+            numbers = self.numeric_pattern.findall(content)
+            months = self.month_pattern.findall(content)
+            dates = self.date_pattern.findall(content)
+            labels = months or dates or [f"Point {i+1}" for i in range(len(numbers))]  # Fallback labels
+            
+            numeric_ratio = len(numbers) / len(content.split()) if content.split() else 0.0
+            if numeric_ratio < self.config.numeric_quality_threshold:
+                doc.processing_info['numeric_processed'] = False  # Not enough numerics
+                return doc
+            
+            # Step 2: Normalize numbers
+            normalized_values = self._normalize_numbers(numbers)
+            
+            # Step 3: Handle gaps/sparsity and multi-metrics (simplified: assume single sequence for now)
+            if len(normalized_values) != len(labels):
+                labels = labels[:len(normalized_values)]  # Align lengths
+            
+            # Step 4: Generate narrative
+            narrative = self._generate_narrative(normalized_values, labels)
+            
+            # Integrate: Replace or append narrative (keep original for transparency)
+            doc.content = f"{narrative}\n\n[Original Numeric Data: {content}]"
+            doc.processing_info.update({
+                'numeric_processed': True,
+                'numeric_ratio': numeric_ratio,
+                'normalized_values': normalized_values,
+                'narrative_generated': narrative
+            })
+            
+            # Update metadata (e.g., token count)
+            doc.metadata.token_count = len(doc.content.split())
+            
+        except Exception as e:
+            logger.warning(f"Numeric processing failed for doc {doc.metadata.source_id}: {str(e)}")
+            doc.processing_info['numeric_error'] = str(e)
+        
+        return doc
+    
+    def _normalize_numbers(self, numbers: List[str]) -> List[float]:
+        """Normalize strings to floats, handling units like M/K."""
+        normalized = []
+        for num in numbers:
+            num = num.replace('$', '').replace(',', '')
+            multiplier = 1
+            if num.endswith('M'):
+                multiplier = 1_000_000
+                num = num[:-1]
+            elif num.endswith('K'):
+                multiplier = 1_000
+                num = num[:-1]
+            try:
+                normalized.append(float(num) * multiplier)
+            except ValueError:
+                continue  # Skip invalid
+        return normalized
+    
+    def _generate_narrative(self, values: List[float], labels: List[str]) -> str:
+        """Generate natural language insights from normalized values."""
+        if not values:
+            return "No numeric data detected."
+        
+        sentences = []
+        for i in range(len(values)):
+            trend = ""
+            if i > 0:
+                prev = values[i-1]
+                curr = values[i]
+                percent_change = ((curr - prev) / prev * 100) if prev != 0 else 0
+                if curr > prev:
+                    trend = f"increased by {abs(percent_change):.1f}%"
+                elif curr < prev:
+                    trend = f"decreased by {abs(percent_change):.1f}%"
+                else:
+                    trend = "remained stable"
+            sentences.append(f"{labels[i]}: value {trend} to ${values[i]:,.0f}." if '$' in labels[i] else f"{labels[i]}: value {trend} to {values[i]:,.0f}.")
+        
+        # Handle gaps (if labels are non-sequential, e.g., missing months)
+        gaps = self._detect_gaps(labels)
+        if gaps:
+            sentences.append(f"No data available for: {', '.join(gaps)}.")
+        
+        # Overall trend
+        overall = "Overall, the trend shows an upward trajectory." if values[-1] > values[0] else "Overall, the trend is stable or declining."
+        
+        return " ".join(sentences) + " " + overall
+    
+    def _detect_gaps(self, labels: List[str]) -> List[str]:
+        """Detect missing labels (e.g., missing months)."""
+        if not labels or not self.month_pattern.match(labels[0]):  # Only for months/dates
+            return []
+        # Simplified: Assume monthly sequence
+        months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        present = {m.lower() for m in labels}
+        return [m for m in months if m.lower() not in present]
+
 class DocumentProcessor:
     """Process and optimize documents for prompt construction"""
     
     def __init__(self, config: PromptConstructionConfig):
         self.config = config
         self.embedding_optimizer = EmbeddingInformedOptimizer()
+        self.numeric_processor = NumericProcessor(config)  # New: Initialize numeric processor
         
     def process_documents(self, raw_docs: List[Dict], query: str, budget: BudgetAllocation) -> List[ProcessedDocument]:
         """Process raw documents into optimized format"""
@@ -182,6 +303,10 @@ class DocumentProcessor:
                 metadata=metadata,
                 processing_info={'original_index': i}
             )
+            
+            # New: Apply numeric processing
+            proc_doc = self.numeric_processor.process_document(proc_doc)
+            
             processed_docs.append(proc_doc)
         
         quality_filtered = self.embedding_optimizer.filter_documents_by_quality(processed_docs, query)
@@ -345,9 +470,15 @@ class PromptTemplateManager:
             """Generate summary for DocumentMetadata object"""
             return f"(score: {metadata.retrieval_score:.2f})"
         
+        def narrative_highlight(text):
+            if '[Original Numeric Data:' in text:  # Detect if narrativized
+                return f"**Numeric Insights:** {text.split('[Original Numeric Data:')[0].strip()}\n\n**Raw Data:** {text.split('[Original Numeric Data:')[1].strip()}"
+            return text
+        
         self.env.filters['truncate_words'] = truncate_words
         self.env.filters['cite'] = citation_format
         self.env.filters['meta'] = metadata_summary
+        self.env.filters['narrative'] = narrative_highlight  # New: Highlight numeric narratives
     
     def _verify_templates(self):
         """Verify that required .j2 template files exist"""
@@ -597,6 +728,10 @@ class ContextEngineer:
                     processed_docs, total_safety_issues, estimated_tokens, start_time
                 )
                 rendered_prompt += "\n\n" + metadata_footer
+
+            # New: Wrap in XML if configured
+            if self.config.xml_wrap:
+                rendered_prompt = self._wrap_in_xml(rendered_prompt, query_id="1")  # Default query_id; can parameterize
             
             logger.info(f"Prompt built successfully: {estimated_tokens} tokens, "
                        f"{len(filtered_docs)} docs, {len(total_safety_issues)} safety issues")
@@ -606,6 +741,15 @@ class ContextEngineer:
         except Exception as e:
             logger.error(f"Error building prompt: {str(e)}")
             return self._build_fallback_prompt(query, raw_docs)
+    
+    def _wrap_in_xml(self, prompt: str, query_id: str = "1") -> str:
+        """Wrap the prompt in XML format using ElementTree."""
+        root = ET.Element('Prompt')
+        qid = ET.SubElement(root, 'QueryID')
+        qid.text = query_id
+        content = ET.SubElement(root, 'Content')
+        content.text = prompt
+        return ET.tostring(root, encoding="unicode")
     
     async def close(self):
         """Close resources and clear caches asynchronously"""

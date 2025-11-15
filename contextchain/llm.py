@@ -1,8 +1,8 @@
 # contextchain/src/llm.py
 """
-Thin LLM client abstraction for ContextChain v2.0
-Provides a unified interface for any LLM backend (Ollama, HuggingFace, OpenAI, etc.)
-Focuses on optimization (caching, retries, streaming) while being provider-agnostic
+Thin LLM client abstraction for ContextChain v2.1
+Supports: Ollama, HF, OpenAI, Anthropic, Grok, OpenRouter
+Features: streaming, caching, retries, metrics, budget-aware
 """
 
 import asyncio
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 
-# Optional imports for specific backends
+# Optional imports
 try:
     import openai
     OPENAI_AVAILABLE = True
@@ -51,9 +51,14 @@ from .acba import BudgetAllocation
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------- #
+# Dataclasses
+# --------------------------------------------------------------------------- #
+from dataclasses import dataclass, asdict
+from typing import Optional
+
 @dataclass
 class LLMConfig:
-    """Configuration for LLM client"""
     model_name: str = "tinyllama"
     api_base: Optional[str] = None
     api_key: Optional[str] = None
@@ -66,14 +71,21 @@ class LLMConfig:
     retry_delay: float = 1.0
     device: str = "cuda" if HF_AVAILABLE and torch and torch.cuda.is_available() else "cpu"
 
+    def dict(self, exclude=None):
+        d = asdict(self)
+        if exclude:
+            for key in exclude:
+                d.pop(key, None)
+        return d
+
+
 @dataclass
 class GenerationResult:
-    """Result from LLM generation"""
     content: str
     tokens_used: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
-    latency_seconds: float = 0.0
+    generation_time: float = 0.0
     finish_reason: Optional[str] = None
     model_used: str = ""
     cached: bool = False
@@ -82,246 +94,227 @@ class GenerationResult:
 
 @dataclass
 class PerformanceMetrics:
-    """Performance tracking metrics"""
     total_requests: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
-    avg_latency: float = 0.0
+    avg_generation_time: float = 0.0
     total_tokens: int = 0
     cache_hit_rate: float = 0.0
     start_time: datetime = field(default_factory=datetime.utcnow)
 
+# --------------------------------------------------------------------------- #
+# Base LLM Client
+# --------------------------------------------------------------------------- #
 class BaseLLMClient(ABC):
-    """Abstract base class for LLM clients"""
     def __init__(self, config: LLMConfig):
         self.config = config
-        self.semaphore = asyncio.Semaphore(5)  # Default concurrency limit
-        self.cache = {} if config.enable_caching else None
+        self.semaphore = asyncio.Semaphore(5)
+        self.cache: Optional[Dict[str, GenerationResult]] = {} if config.enable_caching else None
         self.metrics = PerformanceMetrics()
         logger.info(f"LLM client initialized: {self.__class__.__name__} - {config.model_name}")
 
     @abstractmethod
     async def generate(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> GenerationResult:
-        """Generate a response for the given prompt"""
         pass
 
     @abstractmethod
     async def generate_stream(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> AsyncGenerator[str, None]:
-        """Generate a streaming response"""
         pass
 
     @abstractmethod
     async def health_check(self) -> Dict[str, Any]:
-        """Perform health check on the LLM backend"""
         pass
 
-    async def generate_optimized(self, prompt: str, budget: BudgetAllocation,
-                                stream: bool = False, **kwargs) -> Union[GenerationResult, AsyncGenerator[str, None]]:
-        """Generate response with budget constraints and optimization"""
+    async def generate_optimized(
+        self,
+        prompt: str,
+        budget: BudgetAllocation,
+        stream: bool = False,
+        **kwargs
+    ) -> Union[GenerationResult, AsyncGenerator[str, None]]:
+        max_tokens = min(budget.generation_tokens, self.config.max_tokens)
+
         if self.cache:
-            cache_key = self._get_cache_key(prompt, budget)
+            cache_key = self._get_cache_key(prompt, max_tokens, self.config.temperature)
             if cache_key in self.cache:
-                cached_result = self.cache[cache_key]
-                cached_result.cached = True
-                self.metrics.total_requests += 1
-                return cached_result
+                result = self.cache[cache_key]
+                result.cached = True
+                self._update_metrics(result, success=True)
+                return result
 
         if stream and self.config.enable_streaming:
-            return self.generate_stream(
-                prompt=prompt,
-                max_tokens=min(budget.generation_tokens, self.config.max_tokens),
-                temperature=self.config.temperature,
-                **kwargs
-            )
-        else:
-            async with self.semaphore:
-                for attempt in range(self.config.retry_attempts):
-                    try:
-                        start_time = time.time()
-                        result = await self.generate(
-                            prompt=prompt,
-                            max_tokens=min(budget.generation_tokens, self.config.max_tokens),
-                            temperature=self.config.temperature,
-                            **kwargs
+            return self._stream_with_budget(prompt, max_tokens, budget, **kwargs)
+
+        async with self.semaphore:
+            start_time = time.time()
+            for attempt in range(self.config.retry_attempts):
+                try:
+                    result = await self.generate(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=self.config.temperature,
+                        **kwargs
+                    )
+                    result.generation_time = time.time() - start_time
+                    result.model_used = self.config.model_name
+                    result.retry_count = attempt
+
+                    if self.cache and result.content:
+                        cache_key = self._get_cache_key(prompt, max_tokens, self.config.temperature)
+                        self.cache[cache_key] = result
+                        if len(self.cache) > 1000:
+                            old_keys = list(self.cache.keys())[:500]
+                            for k in old_keys:
+                                del self.cache[k]
+
+                    self._update_metrics(result, success=True)
+                    return result
+
+                except Exception as e:
+                    logger.warning(f"LLM generation failed (attempt {attempt + 1}): {e}")
+                    if attempt < self.config.retry_attempts - 1:
+                        await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
+                    else:
+                        error_result = GenerationResult(
+                            content=f"[Generation failed: {str(e)}]",
+                            generation_time=time.time() - start_time,
+                            finish_reason="error",
+                            retry_count=attempt + 1
                         )
-                        result.latency_seconds = time.time() - start_time
-                        result.model_used = self.config.model_name
-                        result.retry_count = attempt
+                        self._update_metrics(error_result, success=False)
+                        return error_result
 
-                        if self.cache and result.content:
-                            cache_key = self._get_cache_key(prompt, budget)
-                            self.cache[cache_key] = result
-                            if len(self.cache) > 1000:
-                                old_keys = list(self.cache.keys())[:500]
-                                for key in old_keys:
-                                    del self.cache[key]
+    async def _stream_with_budget(self, prompt: str, max_tokens: int, budget: BudgetAllocation, **kwargs):
+        chunks = []
+        start_time = time.time()
+        try:
+            async for chunk in self.generate_stream(prompt, max_tokens, self.config.temperature, **kwargs):
+                chunks.append(chunk)
+                yield chunk
+        except Exception as e:
+            logger.error(f"Streaming failed: {e}")
+            yield f"[Stream error: {e}]"
 
-                        self._update_metrics(result, success=True)
-                        return result
-                    except Exception as e:
-                        logger.warning(f"Generation attempt {attempt + 1} failed: {str(e)}")
-                        if attempt < self.config.retry_attempts - 1:
-                            await asyncio.sleep(self.config.retry_delay * (2 ** attempt))
-                        else:
-                            error_result = GenerationResult(
-                                content=f"Generation failed after {self.config.retry_attempts} attempts: {str(e)}",
-                                latency_seconds=time.time() - start_time,
-                                finish_reason="error",
-                                retry_count=attempt + 1
-                            )
-                            self._update_metrics(error_result, success=False)
-                            return error_result
+        full_content = "".join(chunks)
+        result = GenerationResult(
+            content=full_content,
+            tokens_used=len(full_content.split()) * 1.3,
+            generation_time=time.time() - start_time,
+            stream_chunks=chunks,
+            cached=False
+        )
+        if self.cache:
+            cache_key = self._get_cache_key(prompt, max_tokens, self.config.temperature)
+            self.cache[cache_key] = result
+        self._update_metrics(result, success=True)
 
-    def _get_cache_key(self, prompt: str, budget: BudgetAllocation) -> str:
-        """Generate cache key for prompt and budget"""
+    def _get_cache_key(self, prompt: str, max_tokens: int, temperature: float) -> str:
         key_data = {
-            'prompt': prompt[:500],
-            'model': self.config.model_name,
-            'max_tokens': budget.generation_tokens,
-            'temperature': self.config.temperature
+            "prompt_hash": hashlib.md5(prompt.encode("utf-8")).hexdigest(),
+            "model": self.config.model_name,
+            "max_tokens": max_tokens,
+            "temperature": round(temperature, 2)
         }
-        key_string = json.dumps(key_data, sort_keys=True)
-        return hashlib.md5(key_string.encode()).hexdigest()
+        return json.dumps(key_data, sort_keys=True)
 
     def _update_metrics(self, result: GenerationResult, success: bool):
-        """Update performance metrics"""
         self.metrics.total_requests += 1
         if success:
             self.metrics.successful_requests += 1
             self.metrics.total_tokens += result.tokens_used
-            total_success = self.metrics.successful_requests
-            current_avg = self.metrics.avg_latency
-            self.metrics.avg_latency = ((current_avg * (total_success - 1)) + result.latency_seconds) / total_success
+            n = self.metrics.successful_requests
+            self.metrics.avg_generation_time = (
+                (self.metrics.avg_generation_time * (n - 1) + result.generation_time) / n
+            )
         else:
             self.metrics.failed_requests += 1
         if self.cache:
-            cache_hits = sum(1 for r in [result] if hasattr(r, 'cached') and r.cached)
-            self.metrics.cache_hit_rate = cache_hits / max(self.metrics.total_requests, 1)
+            self.metrics.cache_hit_rate = sum(1 for r in self.cache.values() if r.cached) / max(self.metrics.total_requests, 1)
 
     async def get_performance_stats(self) -> Dict[str, Any]:
-        """Get comprehensive performance statistics"""
         uptime = (datetime.utcnow() - self.metrics.start_time).total_seconds()
         return {
-            'status': 'active' if self.metrics.total_requests > 0 else 'idle',
-            'uptime_seconds': uptime,
-            'total_requests': self.metrics.total_requests,
-            'successful_requests': self.metrics.successful_requests,
-            'failed_requests': self.metrics.failed_requests,
-            'success_rate': self.metrics.successful_requests / max(self.metrics.total_requests, 1),
-            'avg_latency_seconds': self.metrics.avg_latency,
-            'total_tokens_processed': self.metrics.total_tokens,
-            'cache_hit_rate': self.metrics.cache_hit_rate,
-            'model': self.config.model_name
+            "status": "active" if self.metrics.total_requests > 0 else "idle",
+            "uptime_seconds": uptime,
+            "total_requests": self.metrics.total_requests,
+            "success_rate": self.metrics.successful_requests / max(self.metrics.total_requests, 1),
+            "avg_generation_time": round(self.metrics.avg_generation_time, 3),
+            "total_tokens": self.metrics.total_tokens,
+            "cache_hit_rate": round(self.metrics.cache_hit_rate, 3),
+            "model": self.config.model_name
         }
 
     async def close(self):
-        """Close client connections"""
         pass
 
+# --------------------------------------------------------------------------- #
+# Provider Implementations
+# --------------------------------------------------------------------------- #
+
 class OllamaLLM(BaseLLMClient):
-    """Ollama LLM client with streaming support and enhanced handling"""
-    
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         if not HTTPX_AVAILABLE:
-            raise ImportError("httpx library not installed. Run: pip install httpx")
+            raise ImportError("httpx required: pip install httpx")
         self.client = httpx.AsyncClient(
             base_url=config.api_base or "http://localhost:11434",
             timeout=120
         )
-    
+
     async def generate(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> GenerationResult:
         payload = {
             "model": self.config.model_name,
             "prompt": prompt,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": temperature
-            },
+            "options": {"num_predict": max_tokens, "temperature": temperature},
             "stream": False
         }
-        try:
-            response = await self.client.post("/api/generate", json=payload)
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data.get("response"), list):
-                content = "".join(chunk.get("response", "") for chunk in data["response"]).strip()
-            else:
-                content = str(data.get("response", "")).strip()
-            return GenerationResult(
-                content=content,
-                tokens_used=data.get("eval_count", 0) + data.get("prompt_eval_count", 0),
-                input_tokens=data.get("prompt_eval_count", 0),
-                output_tokens=data.get("eval_count", 0),
-                finish_reason=data.get("finish_reason")
-            )
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Ollama generation failed: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Ollama generation error: {str(e)}")
-            raise
+        response = await self.client.post("/api/generate", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        content = data.get("response", "")
+        return GenerationResult(
+            content=content,
+            input_tokens=data.get("prompt_eval_count", 0),
+            output_tokens=data.get("eval_count", 0),
+            tokens_used=data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
+            finish_reason=data.get("done_reason")
+        )
 
-    async def generate_stream(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> AsyncGenerator[str, None]:
+    async def generate_stream(self, prompt: str, max_tokens: int, temperature: float, **kwargs):
         payload = {
             "model": self.config.model_name,
             "prompt": prompt,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": temperature
-            },
+            "options": {"num_predict": max_tokens, "temperature": temperature},
             "stream": True
         }
-        try:
-            async with self.client.stream("POST", "/api/generate", json=payload) as response:
-                response.raise_for_status()
-                content_accum = ""
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        chunk = data.get("response", "")
-                        content_accum += chunk
-                        yield chunk
-                        if data.get("done", False):
-                            logger.debug("Ollama streaming done.")
-                            break
-                    except json.JSONDecodeError:
-                        logger.warning(f"Failed to decode line as JSON: {line}")
-                        continue
-        except Exception as e:
-            logger.error(f"Ollama streaming generation failed: {str(e)}")
-            yield ""
+        async with self.client.stream("POST", "/api/generate", json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.strip(): continue
+                try:
+                    data = json.loads(line)
+                    if data.get("done"): break
+                    yield data.get("response", "")
+                except json.JSONDecodeError:
+                    continue
 
     async def health_check(self) -> Dict[str, Any]:
         try:
-            start_time = time.time()
+            start = time.time()
             resp = await self.client.get("/api/tags")
-            status = "healthy" if resp.status_code == 200 else "unhealthy"
-            latency = time.time() - start_time
             return {
-                "status": status,
-                "model": self.config.model_name,
-                "latency": latency,
-                "timestamp": datetime.utcnow()
+                "status": "healthy" if resp.status_code == 200 else "degraded",
+                "latency": time.time() - start,
+                "model": self.config.model_name
             }
         except Exception as e:
-            logger.error(f"Ollama health check failed: {str(e)}")
-            return {
-                "status": "unhealthy",
-                "model": self.config.model_name,
-                "error": str(e),
-                "timestamp": datetime.utcnow()
-            }
+            return {"status": "unhealthy", "error": str(e)}
 
-    async def close(self) -> None:
+    async def close(self):
         await self.client.aclose()
 
 
 class HuggingFaceLLM(BaseLLMClient):
-    """HuggingFace LLM client"""
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         if not HF_AVAILABLE:
@@ -377,7 +370,6 @@ class HuggingFaceLLM(BaseLLMClient):
                 'timestamp': datetime.utcnow()
             }
         except Exception as e:
-            logger.error(f"Health check failed: {str(e)}")
             return {
                 'status': 'unhealthy',
                 'model': self.config.model_name,
@@ -385,8 +377,8 @@ class HuggingFaceLLM(BaseLLMClient):
                 'timestamp': datetime.utcnow()
             }
 
+
 class OpenAILLM(BaseLLMClient):
-    """OpenAI LLM client"""
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         if not OPENAI_AVAILABLE:
@@ -451,7 +443,6 @@ class OpenAILLM(BaseLLMClient):
                 'timestamp': datetime.utcnow()
             }
         except Exception as e:
-            logger.error(f"Health check failed: {str(e)}")
             return {
                 'status': 'unhealthy',
                 'model': self.config.model_name,
@@ -462,8 +453,8 @@ class OpenAILLM(BaseLLMClient):
     async def close(self):
         await self.client.close()
 
+
 class AnthropicLLM(BaseLLMClient):
-    """Anthropic LLM client"""
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         if not ANTHROPIC_AVAILABLE:
@@ -514,7 +505,6 @@ class AnthropicLLM(BaseLLMClient):
                 'timestamp': datetime.utcnow()
             }
         except Exception as e:
-            logger.error(f"Health check failed: {str(e)}")
             return {
                 'status': 'unhealthy',
                 'model': self.config.model_name,
@@ -525,8 +515,8 @@ class AnthropicLLM(BaseLLMClient):
     async def close(self):
         await self.client.close()
 
+
 class GrokLLM(BaseLLMClient):
-    """Grok LLM client"""
     def __init__(self, config: LLMConfig):
         super().__init__(config)
         if not HTTPX_AVAILABLE:
@@ -580,7 +570,6 @@ class GrokLLM(BaseLLMClient):
                 'timestamp': datetime.utcnow()
             }
         except Exception as e:
-            logger.error(f"Health check failed: {str(e)}")
             return {
                 'status': 'unhealthy',
                 'model': self.config.model_name,
@@ -591,17 +580,125 @@ class GrokLLM(BaseLLMClient):
     async def close(self):
         await self.client.aclose()
 
+
+class OpenRouterLLM(BaseLLMClient):
+    """
+    OpenRouter LLM client implementation.
+    Supports routing to various models via OpenRouter API.
+    """
+    def __init__(self, config: LLMConfig):
+        super().__init__(config)
+        if not HTTPX_AVAILABLE:
+            raise ImportError("httpx library not installed. Run: pip install httpx")
+        if not self.config.api_key:
+            raise ValueError("API key required for OpenRouter")
+        self.client = httpx.AsyncClient(
+            base_url="https://openrouter.ai/api/v1",
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "HTTP-Referer": self.config.api_base or "",  # Optional: Your app's URL
+                "X-Title": "ContextChain App",  # Optional: Your app's name
+            },
+            timeout=self.config.timeout
+        )
+
+    async def generate(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> GenerationResult:
+        messages = kwargs.get('messages', [
+            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": prompt}
+        ])
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False
+        }
+        response = await self.client.post("/chat/completions", json=payload)
+        response.raise_for_status()
+        result_data = response.json()
+        choice = result_data['choices'][0]
+        usage = result_data.get('usage', {})
+        return GenerationResult(
+            content=choice['message']['content'].strip(),
+            tokens_used=usage.get('total_tokens', 0),
+            input_tokens=usage.get('prompt_tokens', 0),
+            output_tokens=usage.get('completion_tokens', 0),
+            finish_reason=choice.get('finish_reason')
+        )
+
+    async def generate_stream(self, prompt: str, max_tokens: int, temperature: float, **kwargs) -> AsyncGenerator[str, None]:
+        messages = kwargs.get('messages', [
+            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": prompt}
+        ])
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True
+        }
+        async with self.client.stream("POST", "/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            full_content = ""
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        if "choices" in data and data["choices"]:
+                            delta = data["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                chunk = delta["content"]
+                                full_content += chunk
+                                yield chunk
+                    except json.JSONDecodeError:
+                        continue
+            # For compatibility, yield the full content if no chunks
+            if not full_content:
+                yield full_content
+
+    async def health_check(self) -> Dict[str, Any]:
+        try:
+            start_time = time.time()
+            response = await self.client.get("/models")
+            status = "healthy" if response.status_code == 200 else "unhealthy"
+            latency = time.time() - start_time
+            return {
+                'status': status,
+                'model': self.config.model_name,
+                'latency_seconds': latency,
+                'timestamp': datetime.utcnow()
+            }
+        except Exception as e:
+            return {
+                'status': 'unhealthy',
+                'model': self.config.model_name,
+                'error': str(e),
+                'timestamp': datetime.utcnow()
+            }
+
+    async def close(self):
+        await self.client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Factory
+# --------------------------------------------------------------------------- #
 def create_llm_client(provider: str, model: str, api_key: str = None, **kwargs) -> BaseLLMClient:
-    """Factory function to create LLM client"""
     config = LLMConfig(model_name=model, api_key=api_key, **kwargs)
-    provider_map = {
+    providers = {
         "ollama": OllamaLLM,
         "huggingface": HuggingFaceLLM,
         "openai": OpenAILLM,
         "anthropic": AnthropicLLM,
-        "grok": GrokLLM
+        "grok": GrokLLM,
+        "openrouter": OpenRouterLLM 
     }
-    client_class = provider_map.get(provider.lower())
-    if not client_class:
-        raise ValueError(f"Unsupported provider: {provider}")
-    return client_class(config)
+    cls = providers.get(provider.lower())
+    if not cls:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+    return cls(config)

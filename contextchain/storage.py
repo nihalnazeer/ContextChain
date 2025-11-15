@@ -1,28 +1,26 @@
 """
 IntelligentStorage for ContextChain v2.0
-- Manages MongoDB client lifecycle with auto-start of local MongoDB if needed
-- Creates and maintains necessary collections for interactions, metadata, and feedback
+- Manages SQLite connection lifecycle
+- Creates and maintains necessary tables for interactions, metadata, and feedback
 - Provides async methods for storing and querying data
 - Designed for seamless integration with ContextChain core.py and API
 """
 
 import asyncio
+import json
 import logging
-import subprocess
-import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from enum import Enum
 
-import motor.motor_asyncio
-from pymongo.errors import ServerSelectionTimeoutError, CollectionInvalid
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-def to_mongodb_serializable(obj: Any) -> Any:
+def to_json_serializable(obj: Any) -> Any:
     """
-    Recursively convert objects to MongoDB-serializable format.
+    Recursively convert objects to JSON-serializable format.
     Handles Enum, datetime, and nested dataclasses/Pydantic models.
     """
     if isinstance(obj, Enum):
@@ -31,152 +29,176 @@ def to_mongodb_serializable(obj: Any) -> Any:
         return obj.isoformat()
     elif hasattr(obj, '__dict__') and not isinstance(obj, (str, int, float, bool, type(None))):
         # Convert dataclasses, Pydantic models, or objects with __dict__
-        return {k: to_mongodb_serializable(v) for k, v in vars(obj).items()}
+        return {k: to_json_serializable(v) for k, v in vars(obj).items()}
     elif isinstance(obj, (list, tuple)):
-        return [to_mongodb_serializable(item) for item in obj]
+        return [to_json_serializable(item) for item in obj]
     elif isinstance(obj, dict):
-        return {k: to_mongodb_serializable(v) for k, v in obj.items()}
+        return {k: to_json_serializable(v) for k, v in obj.items()}
     else:
         return obj
 
 class IntelligentStorage:
-    def __init__(self, mongo_uri: str = "mongodb://localhost:27017/contextchain"):
-        self.mongo_uri = mongo_uri
-        self.mongo_client = None
-        self.db = None
-        self.mongod_process: Optional[subprocess.Popen] = None
-        self._started_local_mongo = False
+    def __init__(self, db_path: str = "contextchain.db"):
+        self.db_path = db_path
+        self.conn: Optional[aiosqlite.Connection] = None
 
     async def initialize(self):
-        """Initialize MongoDB connection, auto-start local mongod if needed"""
+        """Initialize SQLite connection and ensure tables exist"""
         try:
-            self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
-            await self.mongo_client.server_info()  # Test connection
-            self.db = self.mongo_client.get_default_database()
-            logger.info(f"Connected to MongoDB at {self.mongo_uri}")
-            await self._ensure_collections()
-        except ServerSelectionTimeoutError:
-            logger.warning("MongoDB not reachable, attempting to start a local mongod instance")
-            await self._start_local_mongod()
-            await asyncio.sleep(5)  # Wait for mongod to stabilize
-            self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
-            await self.mongo_client.server_info()
-            self.db = self.mongo_client.get_default_database()
-            logger.info(f"Local MongoDB started and connected at {self.mongo_uri}")
-            await self._ensure_collections()
-            self._started_local_mongo = True
+            self.conn = await aiosqlite.connect(self.db_path)
+            await self.conn.execute("PRAGMA foreign_keys = ON;")
+            await self._ensure_tables()
+            logger.info(f"Connected to SQLite at {self.db_path}")
         except Exception as e:
-            logger.error(f"MongoDB initialization failed: {str(e)}")
+            logger.error(f"SQLite initialization failed: {str(e)}")
             raise
 
-    async def _start_local_mongod(self):
-        """Start local mongod process with a temporary data directory"""
-        data_dir = Path("/tmp/contextchain_mongodb")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        self.mongod_process = subprocess.Popen([
-            "mongod",
-            "--dbpath", str(data_dir),
-            "--port", "27017",
-            "--bind_ip", "127.0.0.1",
-            "--quiet"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logger.info("Started local mongod process")
+    async def _ensure_tables(self):
+        """Ensure necessary tables exist with indexes"""
+        # Interactions table
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                complexity TEXT NOT NULL,
+                budget_allocation TEXT NOT NULL,
+                performance_metrics TEXT NOT NULL,
+                success BOOLEAN NOT NULL,
+                error_message TEXT,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_interactions_session ON interactions(session_id)")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(timestamp)")
 
-    async def _ensure_collections(self):
-        """Ensure necessary collections exist with indexes"""
-        # Get existing collections to avoid duplicate creation
-        collections = await self.db.list_collection_names()
+        # Metadata table (for _store_to_sqlite)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_data_type ON metadata(data_type)")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_timestamp ON metadata(timestamp)")
 
-        # Create collections only if they don't exist
-        for collection_name in ["interactions", "metadata", "feedback"]:
-            if collection_name not in collections:
-                try:
-                    await self.db.create_collection(collection_name)
-                    logger.info(f"Created collection: {collection_name}")
-                except CollectionInvalid as e:
-                    logger.warning(f"Collection {collection_name} creation skipped (already exists): {str(e)}")
+        # Metadata log table (for _store_metadata, separate for distinction)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS metadata_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_type TEXT NOT NULL,
+                content_preview TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                routing_decision TEXT DEFAULT 'automatic'
+            )
+        """)
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_logs_data_type ON metadata_logs(data_type)")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_logs_timestamp ON metadata_logs(timestamp)")
 
-        # Create indexes for interactions
-        await self.db.interactions.create_index("session_id")
-        await self.db.interactions.create_index("timestamp")
-        logger.debug("Created indexes for interactions collection")
+        # Feedback table
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                rating INTEGER NOT NULL,
+                comments TEXT,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_session ON feedback(session_id)")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON feedback(timestamp)")
 
-        # Indexes for metadata
-        await self.db.metadata.create_index("data_type")
-        await self.db.metadata.create_index("timestamp")
-        logger.debug("Created indexes for metadata collection")
-
-        # Indexes for feedback
-        await self.db.feedback.create_index("session_id")
-        await self.db.feedback.create_index("timestamp")
-        logger.debug("Created indexes for feedback collection")
+        await self.conn.commit()
+        logger.debug("Ensured tables and indexes for SQLite")
 
     async def log_interaction(self, session_id: str, query: str, complexity: Dict[str, Any],
                               budget_allocation: Dict[str, Any], performance_metrics: Dict[str, Any],
                               success: bool, error_message: Optional[str] = None):
-        """Log interaction data to MongoDB"""
-        doc = {
-            "session_id": session_id,
-            "query": query,
-            "complexity": to_mongodb_serializable(complexity),
-            "budget_allocation": to_mongodb_serializable(budget_allocation),
-            "performance_metrics": to_mongodb_serializable(performance_metrics),
-            "success": success,
-            "error_message": error_message,
-            "timestamp": datetime.utcnow()
-        }
-        result = await self.db.interactions.insert_one(doc)
-        logger.debug(f"Logged interaction {result.inserted_id}")
-        return str(result.inserted_id)
+        """Log interaction data to SQLite"""
+        timestamp = datetime.utcnow().isoformat()
+        cur = await self.conn.execute("""
+            INSERT INTO interactions (session_id, query, complexity, budget_allocation, performance_metrics, success, error_message, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            session_id,
+            query,
+            json.dumps(to_json_serializable(complexity)),
+            json.dumps(to_json_serializable(budget_allocation)),
+            json.dumps(to_json_serializable(performance_metrics)),
+            success,
+            error_message,
+            timestamp
+        ))
+        await self.conn.commit()
+        rowid = cur.lastrowid
+        logger.debug(f"Logged interaction {rowid}")
+        return str(rowid)
 
-    async def _store_to_mongodb(self, data_type: str, content: str, metadata: Dict) -> str:
-        """Store document in MongoDB metadata collection"""
-        doc = {
-            "data_type": data_type,
-            "content": to_mongodb_serializable(content),
-            "metadata": to_mongodb_serializable(metadata),
-            "timestamp": datetime.utcnow()
-        }
-        result = await self.db.metadata.insert_one(doc)
-        logger.debug(f"Stored document in MongoDB with id {result.inserted_id}")
-        return str(result.inserted_id)
+    async def _store_to_sqlite(self, data_type: str, content: str, metadata: Dict) -> str:
+        """Store document in SQLite metadata collection"""
+        timestamp = datetime.utcnow().isoformat()
+        cur = await self.conn.execute("""
+            INSERT INTO metadata (data_type, content, metadata, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (
+            data_type,
+            content,
+            json.dumps(to_json_serializable(metadata)),
+            timestamp
+        ))
+        await self.conn.commit()
+        rowid = cur.lastrowid
+        logger.debug(f"Stored document in SQLite with id {rowid}")
+        return str(rowid)
 
     async def _store_metadata(self, data_type: str, content: str, metadata: Dict, destination: str) -> str:
-        """Store metadata log in MongoDB"""
-        meta_doc = {
-            "data_type": data_type,
-            "content_preview": content[:200],
-            "destination": destination,
-            "metadata": to_mongodb_serializable(metadata),
-            "timestamp": datetime.utcnow(),
-            "routing_decision": "automatic"
-        }
-        result = await self.db.metadata.insert_one(meta_doc)
-        logger.debug(f"Stored metadata log in MongoDB with id {result.inserted_id}")
-        return str(result.inserted_id)
+        """Store metadata log in SQLite"""
+        timestamp = datetime.utcnow().isoformat()
+        content_preview = content[:200]
+        cur = await self.conn.execute("""
+            INSERT INTO metadata_logs (data_type, content_preview, destination, metadata, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            data_type,
+            content_preview,
+            destination,
+            json.dumps(to_json_serializable(metadata)),
+            timestamp
+        ))
+        await self.conn.commit()
+        rowid = cur.lastrowid
+        logger.debug(f"Stored metadata log in SQLite with id {rowid}")
+        return str(rowid)
 
     async def store_feedback(self, session_id: str, rating: int, comments: Optional[str] = None) -> str:
-        """Store feedback in MongoDB"""
-        doc = {
-            "session_id": session_id,
-            "rating": rating,
-            "comments": comments,
-            "timestamp": datetime.utcnow()
-        }
-        result = await self.db.feedback.insert_one(doc)
-        logger.info(f"Stored feedback with id {result.inserted_id}")
-        return str(result.inserted_id)
+        """Store feedback in SQLite"""
+        timestamp = datetime.utcnow().isoformat()
+        cur = await self.conn.execute("""
+            INSERT INTO feedback (session_id, rating, comments, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (
+            session_id,
+            rating,
+            comments,
+            timestamp
+        ))
+        await self.conn.commit()
+        rowid = cur.lastrowid
+        logger.info(f"Stored feedback with id {rowid}")
+        return str(rowid)
 
     async def close(self):
-        """Clean up resources and terminate local mongod if started"""
-        if self.mongo_client:
-            self.mongo_client.close()
-            logger.info("Closed MongoDB client")
-        if self.mongod_process and self._started_local_mongo:
-            self.mongod_process.terminate()
-            await asyncio.sleep(1)
-            logger.info("Terminated local mongod process")
+        """Clean up resources"""
+        if self.conn:
+            await self.conn.close()
+            logger.info("Closed SQLite connection")
 
     def __del__(self):
         """Ensure resources are cleaned up on object deletion"""
-        asyncio.create_task(self.close())
+        if self.conn:
+            asyncio.create_task(self.close())
