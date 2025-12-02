@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextchain"
-version = "1.4.37"
+version = "1.4.38"
 authors = [
     { name = "Nihal Nazeer", email = "Nhaal160@gmail.com" }
 ]

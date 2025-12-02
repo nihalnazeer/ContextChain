@@ -68,7 +68,7 @@ class VectorStoreConfig:
     similarity_threshold: float = 0.7
     fusion_weights: Dict[str, float] = None  # Default: {'dense': 0.7, 'sparse': 0.3}
     enable_reranking: bool = True
-    enable_sparse: bool = True  # Toggle sparse for lighter mode
+    enable_sparse: bool = False  # Toggle sparse for lighter mode
     quality_threshold: float = 0.65
     max_results: int = 100
 
@@ -78,7 +78,7 @@ class MultiVectorEncoder:
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dense_encoder = self._initialize_dense_encoder()
-        self.sparse_encoder = self._initialize_sparse_encoder() if config.enable_sparse else None
+        self.sparse_encoder = None
         self.aspect_encoders = self._initialize_aspect_encoders()
 
     def _initialize_dense_encoder(self):
@@ -122,9 +122,9 @@ class MultiVectorEncoder:
             if self.dense_encoder:
                 dense_vector = await self._encode_dense_async(text)
                 vectors['dense'] = dense_vector
-            if self.sparse_encoder:
-                sparse_vector = self._encode_sparse(text)
-                vectors['sparse'] = sparse_vector
+            #if self.sparse_encoder:
+                #sparse_vector = self._encode_sparse(text)
+                #vectors['sparse'] = sparse_vector
             if query_type in ['analytical', 'comparative', 'temporal']:
                 aspect_vectors = await self._encode_aspects(text, query_type)
                 vectors.update(aspect_vectors)
@@ -304,7 +304,7 @@ class HybridVectorStore:
         self.multi_encoder = MultiVectorEncoder(config)
         self.quality_assessor = EmbeddingQualityAssessor(config.quality_threshold)
         self.dense_store = self._initialize_dense_store()
-        self.sparse_store = self._initialize_sparse_store()
+        self.sparse_store = None
         self.doc_metadata = {}
         self.doc_vectors = {}
         self.retrieval_stats = {'total_queries': 0, 'avg_latency': 0.0, 'quality_filtered_count': 0}
@@ -392,14 +392,16 @@ class HybridVectorStore:
     async def index_documents(self, documents: List[Dict[str, Any]], batch_size: int = 100) -> List[str]:
         logger.info(f"Indexing {len(documents)} documents...")
         doc_ids = []
-        all_texts = [doc.get('content', '') for doc in documents if doc.get('content', '').strip()]
-        if all_texts and self.sparse_store and not self.sparse_store['fitted']:
-            try:
-                self.sparse_store['vectorizer'].fit(all_texts)
-                self.sparse_store['fitted'] = True
-                logger.info("Sparse encoder fitted")
-            except Exception as e:
-                logger.error(f"Error fitting sparse: {e}")
+        # REMOVE sparse fitting logic since sparse_store is None
+        # all_texts = [doc.get('content', '') for doc in documents if doc.get('content', '').strip()]
+        # if all_texts and self.sparse_store and not self.sparse_store['fitted']:
+        #     try:
+        #         self.sparse_store['vectorizer'].fit(all_texts)
+        #         self.sparse_store['fitted'] = True
+        #         logger.info("Sparse encoder fitted")
+        #     except Exception as e:
+        #         logger.error(f"Error fitting sparse: {e}")
+        
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
             batch_ids = await self._index_batch(batch)
@@ -511,19 +513,25 @@ class HybridVectorStore:
         return all(doc_meta.get(key) == value for key, value in metadata_filter.items())
 
     async def _fusion_and_rerank(self, query: str, query_vectors: Dict[str, np.ndarray], dense_results: List[Tuple[str, float]], sparse_results: List[Tuple[str, float]], k: int, enable_reranking: bool) -> List[VectorSearchResult]:
-        fusion_weights = self.config.fusion_weights or {'dense': 0.7, 'sparse': 0.3}
+        # UPDATE: Sparse is disabled, use dense-only weights
+        fusion_weights = self.config.fusion_weights or {'dense': 1.0, 'sparse': 0.0}
+        
         all_results = {}
         for doc_id, score in dense_results:
             if doc_id in self.doc_metadata:
                 all_results[doc_id] = {'dense_score': score, 'sparse_score': 0.0, 'content': self.doc_metadata[doc_id]['content'], 'metadata': self.doc_metadata[doc_id]['metadata']}
-        for doc_id, score in sparse_results:
-            if doc_id in self.doc_metadata:
-                if doc_id in all_results:
-                    all_results[doc_id]['sparse_score'] = score
-                else:
-                    all_results[doc_id] = {'dense_score': 0.0, 'sparse_score': score, 'content': self.doc_metadata[doc_id]['content'], 'metadata': self.doc_metadata[doc_id]['metadata']}
+        
+        # SKIP sparse_results processing since sparse_store is None
+        # for doc_id, score in sparse_results:
+        #     if doc_id in self.doc_metadata:
+        #         if doc_id in all_results:
+        #             all_results[doc_id]['sparse_score'] = score
+        #         else:
+        #             all_results[doc_id] = {'dense_score': 0.0, 'sparse_score': score, 'content': self.doc_metadata[doc_id]['content'], 'metadata': self.doc_metadata[doc_id]['metadata']}
+        
         fused_results = []
         for doc_id, scores in all_results.items():
+            # Now sparse_score is always 0.0, dense_score gets full weight
             fusion_score = fusion_weights['dense'] * scores['dense_score'] + fusion_weights['sparse'] * scores['sparse_score']
             multi_vector_scores = {}
             if doc_id in self.doc_vectors:
@@ -587,7 +595,7 @@ class HybridVectorStore:
             'avg_latency_seconds': self.retrieval_stats['avg_latency'],
             'quality_filter_rate': self.retrieval_stats['quality_filtered_count'] / max(self.retrieval_stats['total_queries'], 1),
             'dense_store_type': self.dense_store['type'],
-            'sparse_enabled': bool(self.sparse_store),
+            'sparse_enabled': False,  # Changed from bool(self.sparse_store)
             'quality_threshold': self.config.quality_threshold,
             'quality_stats': self.quality_assessor.get_quality_statistics()
         }
