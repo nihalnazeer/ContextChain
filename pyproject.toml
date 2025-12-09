@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextchain"
-version = "1.4.38"
+version = "1.4.45"
 authors = [
     { name = "Nihal Nazeer", email = "Nhaal160@gmail.com" }
+    { name = "Shahid Shadu", email = "muhdshahid077@gmail.com"}
 ]
 description = "ContextChain v2.0: Adaptive context optimization framework for LLMs with MongoDB, vector DB, and multi-backend LLM integration"
 readme = "README.md"
